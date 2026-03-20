@@ -4,7 +4,9 @@ Works on MicroPython 1.20+ and CPython 3.10+. Prefers C-accelerated or
 ``cryptography`` backends when available; falls back to pure Python.
 
 Implements: HMAC-SHA256, PBKDF2, AES-256-GCM, ChaCha20-Poly1305,
-hsub generation, key derivation, and JSON-hex encrypt/decrypt helpers.
+hsub generation, key derivation, and JSON encrypt/decrypt helpers
+with support for all 7 HiveMind encodings (HEX, B64, URLSAFE-B64,
+B32, Z85B, Z85P, B91).
 """
 
 from __future__ import annotations
@@ -450,25 +452,150 @@ class ChaCha20Poly1305:
 
 
 # ---------------------------------------------------------------------------
-# JSON-hex encrypt / decrypt helpers
+# Encoding support (7 HiveMind encodings)
 # ---------------------------------------------------------------------------
 
-def encrypt_json_hex(
+# Base64 imports: MicroPython uses ubinascii, CPython uses base64
+try:
+    from ubinascii import b2a_base64, a2b_base64  # type: ignore[import]
+    _HAVE_UBINASCII = True
+except ImportError:
+    _HAVE_UBINASCII = False
+
+try:
+    import base64 as _base64
+    _HAVE_BASE64 = True
+except ImportError:
+    _HAVE_BASE64 = False
+
+# Z85B, Z85P, B91: optional dependency
+try:
+    from z85base91 import Z85B as _Z85B, Z85P as _Z85P, B91 as _B91
+    _HAVE_Z85B91 = True
+except ImportError:
+    _HAVE_Z85B91 = False
+
+
+def _b64_encode(data: bytes) -> bytes:
+    """Encode bytes to base64."""
+    if _HAVE_BASE64:
+        return _base64.b64encode(data)
+    if _HAVE_UBINASCII:
+        return b2a_base64(data).rstrip(b"\n")
+    raise RuntimeError("No base64 backend available")
+
+
+def _b64_decode(data: bytes | str) -> bytes:
+    """Decode base64 to bytes."""
+    if isinstance(data, str):
+        data = data.encode("ascii")
+    if _HAVE_BASE64:
+        return _base64.b64decode(data)
+    if _HAVE_UBINASCII:
+        return a2b_base64(data)
+    raise RuntimeError("No base64 backend available")
+
+
+def get_encoder(encoding: str):
+    """Return an encoder callable ``(bytes) -> bytes`` for the given encoding.
+
+    Supported encodings: ``JSON-HEX``, ``JSON-B64``, ``JSON-URLSAFE-B64``,
+    ``JSON-B32``, ``JSON-Z85B``, ``JSON-Z85P``, ``JSON-B91``.
+    """
+    if encoding == "JSON-HEX":
+        def _hex_enc(data: bytes) -> bytes:
+            return data.hex().encode("ascii")
+        return _hex_enc
+    elif encoding == "JSON-B64":
+        return _b64_encode
+    elif encoding == "JSON-URLSAFE-B64":
+        if not _HAVE_BASE64:
+            raise RuntimeError("base64 module required for URLSAFE-B64")
+        return _base64.urlsafe_b64encode
+    elif encoding == "JSON-B32":
+        if not _HAVE_BASE64:
+            raise RuntimeError("base64 module required for B32")
+        return _base64.b32encode
+    elif encoding == "JSON-Z85B":
+        if not _HAVE_Z85B91:
+            raise RuntimeError("z85base91 package required for Z85B encoding")
+        return _Z85B.encode
+    elif encoding == "JSON-Z85P":
+        if not _HAVE_Z85B91:
+            raise RuntimeError("z85base91 package required for Z85P encoding")
+        return _Z85P.encode
+    elif encoding == "JSON-B91":
+        if not _HAVE_Z85B91:
+            raise RuntimeError("z85base91 package required for B91 encoding")
+        return _B91.encode
+    else:
+        raise ValueError(f"Unsupported encoding: {encoding}")
+
+
+def get_decoder(encoding: str):
+    """Return a decoder callable ``(bytes|str) -> bytes`` for the given encoding.
+
+    Supported encodings: ``JSON-HEX``, ``JSON-B64``, ``JSON-URLSAFE-B64``,
+    ``JSON-B32``, ``JSON-Z85B``, ``JSON-Z85P``, ``JSON-B91``.
+    """
+    if encoding == "JSON-HEX":
+        def _hex_dec(data: bytes | str) -> bytes:
+            if isinstance(data, bytes):
+                data = data.decode("ascii")
+            return bytes.fromhex(data)
+        return _hex_dec
+    elif encoding == "JSON-B64":
+        return _b64_decode
+    elif encoding == "JSON-URLSAFE-B64":
+        if not _HAVE_BASE64:
+            raise RuntimeError("base64 module required for URLSAFE-B64")
+        return _base64.urlsafe_b64decode
+    elif encoding == "JSON-B32":
+        if not _HAVE_BASE64:
+            raise RuntimeError("base64 module required for B32")
+        return _base64.b32decode
+    elif encoding == "JSON-Z85B":
+        if not _HAVE_Z85B91:
+            raise RuntimeError("z85base91 package required for Z85B encoding")
+        return _Z85B.decode
+    elif encoding == "JSON-Z85P":
+        if not _HAVE_Z85B91:
+            raise RuntimeError("z85base91 package required for Z85P encoding")
+        return _Z85P.decode
+    elif encoding == "JSON-B91":
+        if not _HAVE_Z85B91:
+            raise RuntimeError("z85base91 package required for B91 encoding")
+        return _B91.decode
+    else:
+        raise ValueError(f"Unsupported encoding: {encoding}")
+
+
+# ---------------------------------------------------------------------------
+# JSON encrypt / decrypt helpers
+# ---------------------------------------------------------------------------
+
+def encrypt_json(
     key: bytes,
     plaintext: bytes,
     cipher: str = "AES-GCM",
+    encoding: str = "JSON-HEX",
 ) -> str:
-    """Encrypt *plaintext* and return a JSON string with hex-encoded fields.
+    """Encrypt *plaintext* and return a JSON string with encoded fields.
 
-    The JSON object contains ``ciphertext``, ``tag``, and ``nonce`` keys.
+    The JSON object contains ``ciphertext``, ``tag``, and ``nonce`` keys,
+    text-encoded according to *encoding*.
+
     Supported *cipher* values: ``"AES-GCM"`` and ``"ChaCha20-Poly1305"``.
+    Supported *encoding* values: ``"JSON-HEX"``, ``"JSON-B64"``,
+    ``"JSON-URLSAFE-B64"``, ``"JSON-B32"``, ``"JSON-Z85B"``,
+    ``"JSON-Z85P"``, ``"JSON-B91"``.
     """
     if cipher == "AES-GCM":
         if _HAVE_C_MODULE:
             ct, tag, nonce = aes_gcm_encrypt(key, plaintext)
         elif _HAVE_CRYPTOGRAPHY:
             nonce = randbytes(AesGcm.NONCE_SIZE)
-            combined = AESGCM(key).encrypt(nonce[:12], plaintext, None)
+            combined = AESGCM(key).encrypt(nonce, plaintext, None)
             ct, tag = combined[:-16], combined[-16:]
         else:
             nonce = randbytes(AesGcm.NONCE_SIZE)
@@ -486,32 +613,42 @@ def encrypt_json_hex(
     else:
         raise ValueError(f"Unsupported cipher: {cipher}")
 
+    encode = get_encoder(encoding)
+
+    def _to_str(val: bytes | str) -> str:
+        """Ensure encoded value is a string for JSON serialization."""
+        if isinstance(val, bytes):
+            return val.decode("ascii")
+        return val
+
     return json.dumps({
-        "ciphertext": ct.hex(),
-        "tag": tag.hex(),
-        "nonce": nonce.hex(),
+        "ciphertext": _to_str(encode(ct)),
+        "tag": _to_str(encode(tag)),
+        "nonce": _to_str(encode(nonce)),
     })
 
 
-def decrypt_json_hex(
+def decrypt_json(
     key: bytes,
     json_str: str,
     cipher: str = "AES-GCM",
+    encoding: str = "JSON-HEX",
 ) -> bytes:
-    """Decrypt a JSON-hex payload produced by :func:`encrypt_json_hex`.
+    """Decrypt a JSON payload produced by :func:`encrypt_json`.
 
     Raises ``ValueError`` on authentication failure or bad input.
     """
     obj = json.loads(json_str)
-    ct = bytes.fromhex(obj["ciphertext"])
-    tag = bytes.fromhex(obj["tag"])
-    nonce = bytes.fromhex(obj["nonce"])
+    decode = get_decoder(encoding)
+    ct = decode(obj["ciphertext"])
+    tag = decode(obj["tag"])
+    nonce = decode(obj["nonce"])
 
     if cipher == "AES-GCM":
         if _HAVE_C_MODULE:
             return aes_gcm_decrypt(key, ct, tag, nonce)
         if _HAVE_CRYPTOGRAPHY:
-            return AESGCM(key).decrypt(nonce[:12], ct + tag, None)
+            return AESGCM(key).decrypt(nonce, ct + tag, None)
         return AesGcm(key).decrypt(ct, nonce, tag)
     elif cipher == "ChaCha20-Poly1305":
         if _HAVE_C_MODULE:
@@ -521,3 +658,30 @@ def decrypt_json_hex(
         return ChaCha20Poly1305(key).decrypt(ct, nonce, tag)
     else:
         raise ValueError(f"Unsupported cipher: {cipher}")
+
+
+# Backwards-compatible aliases
+def encrypt_json_hex(
+    key: bytes,
+    plaintext: bytes,
+    cipher: str = "AES-GCM",
+) -> str:
+    """Encrypt *plaintext* and return a JSON string with hex-encoded fields.
+
+    DEPRECATED: Use :func:`encrypt_json` with ``encoding="JSON-HEX"`` instead.
+    Kept for backwards compatibility.
+    """
+    return encrypt_json(key, plaintext, cipher=cipher, encoding="JSON-HEX")
+
+
+def decrypt_json_hex(
+    key: bytes,
+    json_str: str,
+    cipher: str = "AES-GCM",
+) -> bytes:
+    """Decrypt a JSON-hex payload produced by :func:`encrypt_json_hex`.
+
+    DEPRECATED: Use :func:`decrypt_json` with ``encoding="JSON-HEX"`` instead.
+    Kept for backwards compatibility.
+    """
+    return decrypt_json(key, json_str, cipher=cipher, encoding="JSON-HEX")

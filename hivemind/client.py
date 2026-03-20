@@ -33,6 +33,8 @@ from hivemind.crypto import (
     generate_hsub,
     extract_iv,
     derive_key,
+    encrypt_json,
+    decrypt_json,
     encrypt_json_hex,
     decrypt_json_hex,
     randbytes,
@@ -99,6 +101,7 @@ class HiveMindClient:
         password: str,
         site_id: str = "micropython",
         preferred_cipher: str = "AES-GCM",
+        preferred_encoding: str = "JSON-HEX",
         reconnect_ms: int = 5000,
     ) -> None:
         self.host: str = host
@@ -108,11 +111,13 @@ class HiveMindClient:
         self.password: str = password
         self.site_id: str = site_id
         self.preferred_cipher: str = preferred_cipher
+        self.preferred_encoding: str = preferred_encoding
         self.reconnect_ms: int = reconnect_ms
 
         self.state: int = STATE_DISCONNECTED
         self._key: Optional[bytes] = None
         self._cipher: Optional[str] = None
+        self._encoding: str = preferred_encoding
         self._client_iv: Optional[bytes] = None
         self._client_hsub: Optional[str] = None
         self._session_id: Optional[str] = None
@@ -174,7 +179,7 @@ class HiveMindClient:
         if self._key is None or self._cipher is None:
             raise RuntimeError("Session key not established")
         envelope = self._build_envelope(msg_type, payload)
-        encrypted = encrypt_json_hex(self._key, envelope.encode(), self._cipher)
+        encrypted = encrypt_json(self._key, envelope.encode(), self._cipher, self._encoding)
         await self._send(encrypted)
 
     # -- connect / disconnect -----------------------------------------------
@@ -285,7 +290,7 @@ class HiveMindClient:
             # Build and send shake response
             response = self._build_envelope("shake", {
                 "envelope": hsub_hex,
-                "encodings": ["JSON-HEX"],
+                "encodings": [self.preferred_encoding],
                 "ciphers": [self.preferred_cipher],
                 "binarize": False,
             })
@@ -300,6 +305,7 @@ class HiveMindClient:
                 return
             self._key = derive_key(self.password, self._client_iv, server_iv)
             self._cipher = payload.get("cipher", self.preferred_cipher)
+            self._encoding = payload.get("encoding", self.preferred_encoding)
             self._set_state(STATE_KEY_DERIVED)
 
             # Send encrypted hello
@@ -322,7 +328,7 @@ class HiveMindClient:
             return
 
         try:
-            plaintext = decrypt_json_hex(self._key, raw, self._cipher)
+            plaintext = decrypt_json(self._key, raw, self._cipher, self._encoding)
             envelope = json.loads(plaintext)
         except (ValueError, TypeError, KeyError):
             return
@@ -392,7 +398,7 @@ class HiveMindClient:
         """
         encoded = binary_encode(MSG_BINARY, bin_type, b"{}", data)
         if self._key is not None and self._cipher is not None:
-            encrypted = encrypt_json_hex(self._key, encoded, self._cipher)
+            encrypted = encrypt_json(self._key, encoded, self._cipher, self._encoding)
             await self._send(encrypted)
         else:
             raise RuntimeError("Session key not established")
