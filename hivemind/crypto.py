@@ -640,9 +640,14 @@ def decrypt_json(
     """
     obj = json.loads(json_str)
     decode = get_decoder(encoding)
-    ct = decode(obj["ciphertext"])
-    tag = decode(obj["tag"])
-    nonce = decode(obj["nonce"])
+
+    # JSON stores encoded values as str; z85/b91 decoders expect bytes
+    def _ensure_bytes(val):
+        return val.encode("utf-8") if isinstance(val, str) else val
+
+    ct = decode(_ensure_bytes(obj["ciphertext"]))
+    tag = decode(_ensure_bytes(obj["tag"]))
+    nonce = decode(_ensure_bytes(obj["nonce"]))
 
     if cipher == "AES-GCM":
         if _HAVE_C_MODULE:
