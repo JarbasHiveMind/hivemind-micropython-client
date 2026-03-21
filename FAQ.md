@@ -18,5 +18,8 @@ A: `mpremote mip install github:OpenVoiceOS/hivemind-micropython-client`
 **Q: What ciphers are supported?**
 A: AES-256-GCM (`AesGcm` — `crypto.py:169`) and ChaCha20-Poly1305 (`ChaCha20Poly1305` — `crypto.py:296`). Negotiated during handshake.
 
+**Q: How does PING flood discovery work?**
+A: When the client receives `PROPAGATE(PING)`, it builds a responsive PING with the same `flood_id` and sends it upstream. `flood_id` deduplication prevents infinite loops. See `client.py:_handle_ping`.
+
 **Q: What is the binary frame format?**
 A: V1 bitstring: pad + versioned + version + type(5) + compressed + metalen(8) + meta + [bintype(4)] + payload. See `binary.py:89-135`.
