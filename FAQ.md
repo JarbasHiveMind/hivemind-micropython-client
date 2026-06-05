@@ -13,7 +13,7 @@ A: Pure Python PBKDF2 with 100k iterations takes minutes on ESP32. Use the froze
 A: `uwebsocket` on MicroPython, `websockets` on CPython — `client.py:14,198`.
 
 **Q: How to install on MicroPython?**
-A: `mpremote mip install github:OpenVoiceOS/hivemind-micropython-client`
+A: `mpremote mip install github:JarbasHiveMind/hivemind-micropython-client`
 
 **Q: What ciphers are supported?**
 A: AES-256-GCM (`AesGcm` — `crypto.py:169`) and ChaCha20-Poly1305 (`ChaCha20Poly1305` — `crypto.py:296`). Negotiated during handshake.
