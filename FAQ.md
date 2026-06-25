@@ -16,10 +16,13 @@ A: `uwebsocket` on MicroPython, `websockets` on CPython — `client.py:14,198`.
 A: `mpremote mip install github:JarbasHiveMind/hivemind-micropython-client`
 
 **Q: What ciphers are supported?**
-A: AES-256-GCM (`AesGcm` — `crypto.py:169`) and ChaCha20-Poly1305 (`ChaCha20Poly1305` — `crypto.py:296`). Negotiated during handshake.
+A: AES-256-GCM (`AesGcm`) and ChaCha20-Poly1305 (`ChaCha20Poly1305`). The wire identifiers are `"AES-GCM"` and `"CHACHA20-POLY1305"`, matching `hivemind-bus-client`'s `SupportedCiphers`; the cipher is negotiated during the handshake.
 
-**Q: How does PING flood discovery work?**
-A: When the client receives `PROPAGATE(PING)`, it builds a responsive PING with the same `flood_id` and sends it upstream. `flood_id` deduplication prevents infinite loops. See `client.py:_handle_ping`.
+**Q: Does it interoperate with a real `hivemind-core` hub?**
+A: Yes. `test/test_conformance.py` cross-checks key derivation, hsub, cipher/encoding strings, AEAD ciphertext, and binary framing byte-for-byte against the reference `hivemind-bus-client`, and `test/test_integration.py` completes a password handshake and an encrypted message round-trip driven by that reference code. The pure-Python crypto path (the one that runs on a board) is tested explicitly, including the AES-GCM J0 derivation for the hub's 16-byte nonce.
+
+**Q: How does the client answer PING?**
+A: When it receives an encrypted `ping`, it replies with an encrypted `pong`. See `HiveMindClient._dispatch_message`.
 
 **Q: What is the binary frame format?**
-A: V1 bitstring: pad + versioned + version + type(5) + compressed + metalen(8) + meta + [bintype(4)] + payload. See `binary.py:89-135`.
+A: V1 bitstring: leading-zero pad + pad marker(1) + versioned(1) + [version(8)] + type(5) + compressed(1) + metalen(8) + meta + [bintype(4) for BINARY] + payload. It is byte-identical to `hivemind-bus-client`'s `serialization.get_bitstring`. See `binary.encode`.

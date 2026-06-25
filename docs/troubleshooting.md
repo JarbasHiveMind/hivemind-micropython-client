@@ -27,7 +27,7 @@ ValueError: AES-GCM authentication failed
 
 Client and hub disagree on cipher or encoding.
 
-- Make sure both support the chosen cipher (`AES-GCM` vs `ChaCha20-Poly1305`).
+- Make sure both support the chosen cipher (`AES-GCM` vs `CHACHA20-POLY1305`).
 - Try the defaults: `preferred_cipher="AES-GCM"`, `preferred_encoding="JSON-HEX"`.
 - The `JSON-Z85B` / `JSON-Z85P` / `JSON-B91` encodings require the `z85base91` package; without it, choose a different encoding.
 

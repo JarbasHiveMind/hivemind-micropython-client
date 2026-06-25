@@ -91,7 +91,7 @@ client.on_state_change = lambda state: print("state:", state)
 client = HiveMindClient(
     host="192.168.1.100", port=5678,
     username="esp32", access_key="key", password="pass",
-    preferred_cipher="ChaCha20-Poly1305",   # or "AES-GCM"
+    preferred_cipher="CHACHA20-POLY1305",   # or "AES-GCM"
     preferred_encoding="JSON-B91",          # most compact; needs z85base91
 )
 ```

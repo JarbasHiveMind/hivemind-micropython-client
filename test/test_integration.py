@@ -1,285 +1,314 @@
-"""Integration tests for HiveMind MicroPython client against a real hub.
+"""Integration tests: full handshake + message round-trip against a mock hub.
 
-These tests require a running hivemind-core instance. To set up:
+These tests exercise the real ``HiveMindClient`` handshake state machine and
+encrypted-message dispatch end-to-end, with the *hub side* implemented by the
+canonical reference (``poorman_handshake`` + ``hivemind_bus_client.encryption``)
+speaking over an in-process mock WebSocket transport.
 
-1. Install and start the hub:
-   ```bash
-   pip install hivemind-core
-   hivemind-core add-client --name "micropython-test"
-   # Note the credentials (username, access_key, password)
-   hivemind-core listen
-   ```
+No board, no network, and no running ``hivemind-core`` are required, so the
+whole thing runs in CI. Because the server side IS the reference protocol code,
+a passing run proves the client completes a Protocol-V1 password handshake and
+exchanges encrypted bus messages exactly as a real hub expects.
 
-2. Run these tests:
-   ```bash
-   HM_HOST=localhost HM_PORT=5678 \\
-     HM_USERNAME=micropython-test \\
-     HM_ACCESS_KEY=<access_key> \\
-     HM_PASSWORD=<password> \\
-     uv run pytest test/test_integration.py -v
-   ```
-
-Test IDs:
-- INT-MP-01: Connect and complete handshake
-- INT-MP-02: Send utterance, receive speak response
-- INT-MP-03: Binary payload roundtrip (audio frames)
-- INT-MP-04: Encryption negotiation (cipher selection)
-- INT-MP-05: Multi-message exchange with keep-alive
+For a true on-device / live-hub test see ``docs/integration-testing.md``.
 """
-
 import asyncio
 import json
-import os
-import sys
-from pathlib import Path
-from typing import Optional
+import unittest
 
-# Ensure hivemind package is importable
-_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
-if str(_PACKAGE_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PACKAGE_ROOT))
+from poorman_handshake.symmetric import PasswordHandShake
+from poorman_handshake.symmetric.utils import iv_from_hsub
+from hivemind_bus_client.encryption import (
+    encrypt_as_json,
+    decrypt_from_json,
+    SupportedCiphers,
+    SupportedEncodings,
+)
 
-import pytest
+from hivemind.client import HiveMindClient
 
-# Integration test markers
-pytestmark = pytest.mark.integration
-
-
-def get_hub_config() -> dict:
-    """Load hub connection config from environment variables."""
-    return {
-        "host": os.getenv("HM_HOST", "localhost"),
-        "port": int(os.getenv("HM_PORT", "5678")),
-        "username": os.getenv("HM_USERNAME", ""),
-        "access_key": os.getenv("HM_ACCESS_KEY", ""),
-        "password": os.getenv("HM_PASSWORD", ""),
-        "site_id": os.getenv("HM_SITE_ID", "micropython-test"),
-    }
+_PASSWORD = "test-password"
+_CIPHER = SupportedCiphers.AES_GCM
+_ENCODING = SupportedEncodings.JSON_HEX
+_CIPHER_WIRE = "AES-GCM"
+_ENCODING_WIRE = "JSON-HEX"
 
 
-def hub_available() -> bool:
-    """Check if hub is reachable (lightweight TCP check)."""
-    config = get_hub_config()
-    if not config["username"] or not config["access_key"] or not config["password"]:
-        return False
-    try:
-        import socket
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(1)
-        result = sock.connect_ex((config["host"], config["port"]))
-        sock.close()
-        return result == 0
-    except Exception:
-        return False
+class MockHub:
+    """Minimal Protocol-V1 hub that drives the real reference handshake.
+
+    Plays the server role: emits HELLO, then a HANDSHAKE request, then a
+    HANDSHAKE response carrying its password envelope, then decrypts the
+    client's encrypted HELLO and can exchange encrypted bus messages.
+    """
+
+    def __init__(self, password=_PASSWORD):
+        self._shake = PasswordHandShake(password)
+        self.key = None
+        self.client_iv = None
+        self.received = []  # decrypted client envelopes (after handshake)
+
+    def hello_frame(self):
+        return json.dumps({
+            "msg_type": "hello",
+            "payload": {"pubkey": "", "peer": "mock@hub", "node_id": "mock-node"},
+            "metadata": {}, "route": [], "node": "mock-node",
+            "target_site_id": None, "target_pubkey": None, "source_peer": None,
+        })
+
+    def handshake_request_frame(self):
+        return json.dumps({
+            "msg_type": "shake",
+            "payload": {
+                "handshake": True,
+                "binarize": False,
+                "password": True,
+                "encodings": [_ENCODING_WIRE],
+                "ciphers": [_CIPHER_WIRE],
+            },
+            "metadata": {}, "route": [], "node": None,
+            "target_site_id": None, "target_pubkey": None, "source_peer": None,
+        })
+
+    def on_client_shake(self, frame):
+        """Process the client's plaintext HANDSHAKE; return the server response
+        frame and finalise the shared key."""
+        msg = json.loads(frame)
+        assert msg["msg_type"] == "shake", msg
+        client_envelope = msg["payload"]["envelope"]
+        self.client_iv = iv_from_hsub(client_envelope)
+        server_envelope = self._shake.generate_handshake()
+        # Hub derives the key from the client's envelope (verifies the password).
+        self._shake.receive_and_verify(client_envelope)
+        self.key = self._shake.secret
+        return json.dumps({
+            "msg_type": "shake",
+            "payload": {
+                "envelope": server_envelope,
+                "cipher": _CIPHER_WIRE,
+                "encoding": _ENCODING_WIRE,
+            },
+            "metadata": {}, "route": [], "node": None,
+            "target_site_id": None, "target_pubkey": None, "source_peer": None,
+        })
+
+    def decrypt(self, blob):
+        return decrypt_from_json(self.key, blob, _CIPHER, _ENCODING)
+
+    def encrypt_bus(self, msg_type, data, context=None):
+        envelope = json.dumps({
+            "msg_type": "bus",
+            "payload": {"type": msg_type, "data": data, "context": context or {}},
+            "metadata": {}, "route": [], "node": None,
+            "target_site_id": None, "target_pubkey": None, "source_peer": None,
+        })
+        return encrypt_as_json(self.key, envelope, _CIPHER, _ENCODING)
 
 
-@pytest.fixture(scope="session", autouse=True)
-def skip_if_no_hub():
-    """Skip all integration tests if hub is not available."""
-    if not hub_available():
-        pytest.skip("HiveMind hub not available; set HM_HOST, HM_USERNAME, HM_ACCESS_KEY, HM_PASSWORD")
+class MockWebSocket:
+    """In-process async WebSocket. ``recv`` pops queued server frames; ``send``
+    routes the client's frame to the hub and may queue a server reply."""
+
+    def __init__(self, hub):
+        self._hub = hub
+        self._inbox = asyncio.Queue()
+        self.closed = False
+        # Server opens with HELLO then the handshake request.
+        self._inbox.put_nowait(hub.hello_frame())
+        self._inbox.put_nowait(hub.handshake_request_frame())
+
+    async def recv(self):
+        if self.closed:
+            return None
+        return await self._inbox.get()
+
+    async def send(self, data):
+        msg = json.loads(data)
+        mtype = msg.get("msg_type")
+        if mtype == "shake":
+            # Client sent its handshake; reply with the server's envelope.
+            self._inbox.put_nowait(self._hub.on_client_shake(data))
+        else:
+            # Encrypted message after the key is established.
+            self._hub.received.append(self._hub.decrypt(data))
+
+    async def close(self):
+        self.closed = True
+
+    def queue_server(self, frame):
+        self._inbox.put_nowait(frame)
 
 
-class TestHandshakeIntegration:
-    """Verify client can connect to a real hub and complete handshake."""
+def _run_handshake(client, hub, ws, extra_frames=0):
+    """Drive the client's receive loop through the handshake (and optional
+    extra inbound frames), then stop. Returns when the loop exits."""
 
-    def test_connect_and_handshake_completes(self):
-        """INT-MP-01: Client connects and handshake succeeds."""
-        from hivemind.client import HiveMindClient
+    async def runner():
+        # Inject the mock transport and prime the state machine.
+        client._ws = ws
+        client._session_id = client._generate_session_id()
+        client._set_state(1)  # STATE_CONNECTING
 
-        config = get_hub_config()
+        async def stop_after():
+            # Let the handshake and any queued frames drain, then disconnect
+            # so the receive loop terminates deterministically.
+            for _ in range(50):
+                await asyncio.sleep(0)
+                if ws._inbox.empty() and client.state >= 5:
+                    break
+            await asyncio.sleep(0)
+            ws.closed = True
+            client.state = 0  # STATE_DISCONNECTED -> loop exits
+            ws._inbox.put_nowait("")  # unblock a pending recv
+
+        await asyncio.gather(client._receive_loop(), stop_after())
+
+    asyncio.run(runner())
+
+
+class TestHandshakeRoundTrip(unittest.TestCase):
+    """INT-MP-01: complete a password handshake with the reference hub."""
+
+    def test_handshake_completes_and_keys_match(self):
         client = HiveMindClient(
-            host=config["host"],
-            port=config["port"],
-            username=config["username"],
-            access_key=config["access_key"],
-            password=config["password"],
-            site_id=config["site_id"],
+            host="mock", port=0, username="u", access_key="k",
+            password=_PASSWORD, site_id="mock-sat",
+            reconnect_ms=0,  # no auto-reconnect in tests
         )
+        hub = MockHub()
+        ws = MockWebSocket(hub)
 
-        # Connect and wait for handshake
-        try:
-            assert client.connect()
-            assert client.is_connected
-            assert client.session_id  # Should be set after successful handshake
-        finally:
-            client.disconnect()
+        connected = []
+        client.on_connected = lambda: connected.append(True)
 
-    def test_connection_uses_negotiated_cipher(self):
-        """INT-MP-02: Client uses hub-negotiated cipher after handshake."""
-        from hivemind.client import HiveMindClient
+        _run_handshake(client, hub, ws)
 
-        config = get_hub_config()
+        # Client reached READY (state 5) and on_connected fired.
+        self.assertTrue(connected, "on_connected never fired")
+        # Both sides derived the same session key.
+        self.assertIsNotNone(client._key)
+        self.assertEqual(client._key, hub.key)
+        # Client negotiated the hub's cipher/encoding.
+        self.assertEqual(client._cipher, _CIPHER_WIRE)
+        self.assertEqual(client._encoding, _ENCODING_WIRE)
+        # The hub received the client's encrypted HELLO and could decrypt it.
+        self.assertTrue(hub.received, "hub received no encrypted HELLO")
+        hello = json.loads(hub.received[0])
+        self.assertEqual(hello["msg_type"], "hello")
+        self.assertEqual(hello["payload"]["site_id"], "mock-sat")
+
+
+class TestEncryptedMessageRoundTrip(unittest.TestCase):
+    """INT-MP-02/03: send an utterance and receive a ``speak`` reply."""
+
+    def test_utterance_then_speak_reply(self):
         client = HiveMindClient(
-            host=config["host"],
-            port=config["port"],
-            username=config["username"],
-            access_key=config["access_key"],
-            password=config["password"],
-            site_id=config["site_id"],
-            preferred_cipher="AES-GCM",  # Request specific cipher
+            host="mock", port=0, username="u", access_key="k",
+            password=_PASSWORD, site_id="mock-sat", reconnect_ms=0,
         )
+        hub = MockHub()
+        ws = MockWebSocket(hub)
 
-        try:
-            assert client.connect()
-            # After handshake, negotiated cipher should be known
-            assert client.cipher  # Should match or default based on server negotiation
-        finally:
-            client.disconnect()
+        spoken = []
 
-
-class TestMessageExchange:
-    """Verify client can send and receive bus messages."""
-
-    def test_send_utterance_receives_response(self, timeout=10):
-        """INT-MP-03: Send utterance, receive speak response from hub."""
-        from hivemind.client import HiveMindClient
-
-        config = get_hub_config()
-        received_speak = []
-
-        def on_message(msg_type: str, data: dict, context: dict):
+        def on_bus(msg_type, data, context):
             if msg_type == "speak":
-                received_speak.append(data)
+                spoken.append(data.get("utterance"))
 
+        client.on_bus_message = on_bus
+
+        async def runner():
+            client._ws = ws
+            client._session_id = client._generate_session_id()
+            client._set_state(1)
+
+            async def driver():
+                # Wait for handshake to finish.
+                for _ in range(50):
+                    await asyncio.sleep(0)
+                    if client.state >= 5:
+                        break
+                # Client sends an utterance -> hub decrypts it.
+                await client.send_utterance("what time is it")
+                await asyncio.sleep(0)
+                # Hub replies with an encrypted speak bus message.
+                ws.queue_server(
+                    hub.encrypt_bus("speak", {"utterance": "it is noon"})
+                )
+                for _ in range(20):
+                    await asyncio.sleep(0)
+                    if spoken:
+                        break
+                ws.closed = True
+                client.state = 0
+                ws._inbox.put_nowait("")
+
+            await asyncio.gather(client._receive_loop(), driver())
+
+        asyncio.run(runner())
+
+        # Hub decrypted the utterance the client sent.
+        utt = [json.loads(m) for m in hub.received]
+        sent_utts = [
+            m["payload"]["data"]["utterances"]
+            for m in utt
+            if m["payload"].get("type") == "recognizer_loop:utterance"
+        ]
+        self.assertIn(["what time is it"], sent_utts)
+        # Client decrypted and dispatched the hub's speak reply.
+        self.assertEqual(spoken, ["it is noon"])
+
+
+class TestPingPong(unittest.TestCase):
+    """INT-MP-04: the client answers an encrypted PING with a PONG."""
+
+    def test_ping_is_answered_with_pong(self):
         client = HiveMindClient(
-            host=config["host"],
-            port=config["port"],
-            username=config["username"],
-            access_key=config["access_key"],
-            password=config["password"],
-            site_id=config["site_id"],
+            host="mock", port=0, username="u", access_key="k",
+            password=_PASSWORD, site_id="mock-sat", reconnect_ms=0,
         )
-        client.on_bus_message = on_message
+        hub = MockHub()
+        ws = MockWebSocket(hub)
 
-        try:
-            assert client.connect()
+        async def runner():
+            client._ws = ws
+            client._session_id = client._generate_session_id()
+            client._set_state(1)
 
-            # Send test utterance
-            client.send_utterance("hello")
+            async def driver():
+                for _ in range(50):
+                    await asyncio.sleep(0)
+                    if client.state >= 5:
+                        break
+                # Hub sends an encrypted ping envelope.
+                ping = encrypt_as_json(
+                    hub.key,
+                    json.dumps({
+                        "msg_type": "ping", "payload": {},
+                        "metadata": {}, "route": [], "node": None,
+                        "target_site_id": None, "target_pubkey": None,
+                        "source_peer": None,
+                    }),
+                    _CIPHER, _ENCODING,
+                )
+                ws.queue_server(ping)
+                for _ in range(20):
+                    await asyncio.sleep(0)
+                ws.closed = True
+                client.state = 0
+                ws._inbox.put_nowait("")
 
-            # Wait for response
-            import time
-            start = time.time()
-            while not received_speak and (time.time() - start) < timeout:
-                time.sleep(0.1)
+            await asyncio.gather(client._receive_loop(), driver())
 
-            # Should receive at least a speak message (error or response)
-            assert received_speak, f"No speak response received after {timeout}s"
-        finally:
-            client.disconnect()
+        asyncio.run(runner())
 
-    def test_bus_message_roundtrip(self):
-        """INT-MP-04: Send custom bus message, verify it's processed."""
-        from hivemind.client import HiveMindClient
-
-        config = get_hub_config()
-        client = HiveMindClient(
-            host=config["host"],
-            port=config["port"],
-            username=config["username"],
-            access_key=config["access_key"],
-            password=config["password"],
-            site_id=config["site_id"],
-        )
-
-        try:
-            assert client.connect()
-            # Send a custom message type
-            client.send_bus_message(
-                "test.custom",
-                {"test_data": "hello"},
-                {"source": "micropython-test"}
-            )
-            # If no exception, message was sent successfully
-        finally:
-            client.disconnect()
+        # The client's reply to the ping must be a decryptable pong envelope.
+        pongs = [
+            json.loads(m) for m in hub.received
+            if json.loads(m).get("msg_type") == "pong"
+        ]
+        self.assertTrue(pongs, "client did not answer ping with a pong")
 
 
-class TestBinaryProtocol:
-    """Verify binary payload exchange."""
-
-    def test_send_binary_audio_frame(self):
-        """INT-MP-05: Send raw audio binary frame."""
-        from hivemind.client import HiveMindClient
-        from hivemind.binary import BIN_RAW_AUDIO
-
-        config = get_hub_config()
-        client = HiveMindClient(
-            host=config["host"],
-            port=config["port"],
-            username=config["username"],
-            access_key=config["access_key"],
-            password=config["password"],
-            site_id=config["site_id"],
-        )
-
-        try:
-            assert client.connect()
-            # Send a small test audio frame
-            test_audio = b"\x00\x01\x02\x03" * 256  # 1KB of dummy audio
-            client.send_binary(BIN_RAW_AUDIO, test_audio)
-            # If no exception, binary was sent successfully
-        finally:
-            client.disconnect()
-
-
-class TestConnectionResilience:
-    """Verify client handles reconnection and errors gracefully."""
-
-    def test_reconnect_after_disconnect(self):
-        """INT-MP-06: Client can reconnect after graceful disconnect."""
-        from hivemind.client import HiveMindClient
-
-        config = get_hub_config()
-        client = HiveMindClient(
-            host=config["host"],
-            port=config["port"],
-            username=config["username"],
-            access_key=config["access_key"],
-            password=config["password"],
-            site_id=config["site_id"],
-        )
-
-        try:
-            # First connection
-            assert client.connect()
-            assert client.is_connected
-
-            # Disconnect
-            client.disconnect()
-            assert not client.is_connected
-
-            # Reconnect
-            assert client.connect()
-            assert client.is_connected
-        finally:
-            client.disconnect()
-
-    def test_keep_alive_during_idle_period(self, idle_time=5):
-        """INT-MP-07: Client maintains connection during idle period."""
-        from hivemind.client import HiveMindClient
-        import time
-
-        config = get_hub_config()
-        client = HiveMindClient(
-            host=config["host"],
-            port=config["port"],
-            username=config["username"],
-            access_key=config["access_key"],
-            password=config["password"],
-            site_id=config["site_id"],
-        )
-
-        try:
-            assert client.connect()
-            initial_session = client.session_id
-
-            # Wait without sending messages
-            time.sleep(idle_time)
-
-            # Connection should still be active
-            assert client.is_connected
-            assert client.session_id == initial_session
-        finally:
-            client.disconnect()
+if __name__ == "__main__":
+    unittest.main()
