@@ -122,7 +122,7 @@ The session key is `PBKDF2(password)` mixed with the two 8-byte IVs exchanged in
 | `access_key` | Access key from `hivemind-core add-client` | — |
 | `password` | Password from `hivemind-core add-client` | — |
 | `site_id` | Site identifier reported to the hub | `"micropython"` |
-| `preferred_cipher` | `"AES-GCM"` or `"ChaCha20-Poly1305"` | `"AES-GCM"` |
+| `preferred_cipher` | `"AES-GCM"` or `"CHACHA20-POLY1305"` | `"AES-GCM"` |
 | `preferred_encoding` | One of the 7 JSON encodings (see docs) | `"JSON-HEX"` |
 | `reconnect_ms` | Reconnect delay after a drop | `5000` |
 

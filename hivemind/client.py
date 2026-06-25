@@ -38,6 +38,9 @@ from hivemind.crypto import (
     encrypt_json_hex,
     decrypt_json_hex,
     randbytes,
+    CIPHER_AES_GCM,
+    CIPHER_CHACHA20,
+    _norm_cipher,
 )
 from hivemind.binary import encode as binary_encode, decode as binary_decode
 
@@ -100,7 +103,7 @@ class HiveMindClient:
         access_key: str,
         password: str,
         site_id: str = "micropython",
-        preferred_cipher: str = "AES-GCM",
+        preferred_cipher: str = CIPHER_AES_GCM,
         preferred_encoding: str = "JSON-HEX",
         reconnect_ms: int = 5000,
     ) -> None:
@@ -110,7 +113,9 @@ class HiveMindClient:
         self.access_key: str = access_key
         self.password: str = password
         self.site_id: str = site_id
-        self.preferred_cipher: str = preferred_cipher
+        # Normalise to the canonical wire value so cipher negotiation strings
+        # byte-match what the hub (hivemind-bus-client) expects.
+        self.preferred_cipher: str = _norm_cipher(preferred_cipher)
         self.preferred_encoding: str = preferred_encoding
         self.reconnect_ms: int = reconnect_ms
 

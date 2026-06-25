@@ -1,116 +1,124 @@
-# Integration Testing Guide
+# Integration & Conformance Testing
 
-This guide explains how to run integration tests that verify the MicroPython client works correctly against a real HiveMind hub.
+This client is tested at two levels. The first runs in CI on every PR with no
+board and no network; the second is a manual procedure against a real hub and
+(optionally) real hardware.
 
-## Prerequisites
+## 1. Automated tests (CI, no hub, no board)
 
-1. **HiveMind Hub** — Install and run `hivemind-core`:
-   ```bash
-   pip install hivemind-core
-   hivemind-core listen  # Starts hub on localhost:5678
-   ```
-
-2. **Hub Credentials** — Register a client:
-   ```bash
-   hivemind-core add-client --name "micropython-test"
-   # Output:
-   # Client registered: micropython-test
-   # Access Key: <access_key>
-   # Password: <password>
-   # Note these for test environment variables
-   ```
-
-3. **Test Dependencies**:
-   ```bash
-   uv pip install pytest
-   ```
-
-## Running Integration Tests
-
-Set environment variables and run pytest:
+`test/` runs entirely under CPython and is what the GitHub Actions workflow
+executes on every push and PR to `dev`/`master`. It needs only the reference
+HiveMind stack (`test-requirements.txt`):
 
 ```bash
-export HM_HOST=localhost
-export HM_PORT=5678
-export HM_USERNAME=micropython-test
-export HM_ACCESS_KEY=<your_access_key>
-export HM_PASSWORD=<your_password>
-export HM_SITE_ID=micropython-test
-
-uv run pytest test/test_integration.py -v -m integration
+uv pip install -r test-requirements.txt
+PYTHONPATH="$PWD" pytest test/ -v
 ```
 
-### Test Categories
+| File | What it proves |
+|------|----------------|
+| `test_crypto.py` | AES-GCM / ChaCha20-Poly1305 and all JSON encodings round-trip; HMAC/PBKDF2 against RFC vectors. |
+| `test_binary.py` | The bitstring binary codec round-trips for every message type. |
+| `test_conformance.py` | Byte-for-byte Protocol-V1 interop **against the reference `hivemind-bus-client`**: key derivation, hsub format, cipher/encoding wire strings, AES-GCM/ChaCha20 ciphertext (both the CPython `cryptography` path **and** the pure-Python on-device path), and binary framing. |
+| `test_integration.py` | A full **password handshake + encrypted message round-trip** where the hub side is the real reference protocol code driven over an in-process mock WebSocket — handshake, encrypted `HELLO`, utterance/`speak`, and `PING`/`PONG`. |
 
-| Test ID | Test Name | Validates |
-|---------|-----------|-----------|
-| INT-MP-01 | `test_connect_and_handshake_completes` | Handshake protocol, session establishment |
-| INT-MP-02 | `test_connection_uses_negotiated_cipher` | Cipher negotiation, handshake completion |
-| INT-MP-03 | `test_send_utterance_receives_response` | BUS message exchange, end-to-end routing |
-| INT-MP-04 | `test_bus_message_roundtrip` | Custom message type support |
-| INT-MP-05 | `test_send_binary_audio_frame` | Binary protocol, audio payload handling |
-| INT-MP-06 | `test_reconnect_after_disconnect` | Graceful reconnect, session recovery |
-| INT-MP-07 | `test_keep_alive_during_idle_period` | PING/PONG keep-alive, connection stability |
+Because the conformance and integration tests use the genuine reference
+implementation as the other end of the wire, a green run guarantees the client
+speaks Protocol V1 exactly as `hivemind-core` expects — without a running hub.
 
-## Docker Setup (Optional)
+### Why the pure-Python crypto path is tested explicitly
 
-For automated CI, run the hub in Docker:
+On a desktop the client uses `cryptography` for AES-GCM/ChaCha20. On a
+microcontroller there is no `cryptography`, so the **pure-Python** AEAD code
+runs instead. `test_conformance.py` forces that path and cross-checks it against
+the reference, so an on-device-only crypto regression (e.g. the AES-GCM J0
+derivation for the hub's 16-byte nonce) cannot hide behind the faster backend.
+
+## 2. Manual live-hub test
+
+This exercises the real WebSocket transport against a running `hivemind-core`.
+It is **not** in CI (it needs a hub and the OVOS stack); run it locally.
+
+### Set up a hub
 
 ```bash
-docker run -p 5678:5678 -p 5679:5679 \
-  -e HIVEMIND_DB=json \
-  hivemind:latest
-
-# In another terminal, add a test client:
-docker exec <container> hivemind-core add-client --name "micropython-test"
+pip install hivemind-core
+hivemind-core add-client --name "micropython-test"
+# note the Access Key and Password it prints
+hivemind-core listen           # serves ws://localhost:5678
 ```
 
-## Troubleshooting
+### Connect with the client (CPython)
 
-### Connection refused
-- Ensure hub is running: `curl http://localhost:5679/ping`
-- Check firewall if connecting remotely
+The client API is **async**. Run this from a checkout with `hivemind/` on the
+path (`pip install websockets cryptography z85base91` for the fast path):
 
-### Handshake timeout
-- Verify credentials (username, access_key, password)
-- Check hub logs for authentication errors
+```python
+import asyncio
+from hivemind.client import HiveMindClient
 
-### "No speak response received"
-- May indicate hub cannot reach the NLP backend
-- Verify hub has a skill/agent configured to handle `recognizer_loop:utterance`
-- Check hub logs for skill execution errors
+async def main():
+    got = asyncio.Event()
+    client = HiveMindClient(
+        host="localhost", port=5678,
+        username="micropython-test",
+        access_key="<access_key>", password="<password>",
+        site_id="micropython-test",
+        reconnect_ms=0,
+    )
 
-## Expected Message Flow
+    def on_bus(msg_type, data, context):
+        if msg_type == "speak":
+            print("hub says:", data.get("utterance"))
+            got.set()
 
-### Utterance → Response
+    async def on_connected():
+        await client.send_utterance("hello")
 
-```
-Client sends:
-  recognizer_loop:utterance {utterances: ["hello"]}
+    client.on_bus_message = on_bus
+    client.on_connected = on_connected
 
-Hub processes:
-  (NLU -> Intent matching -> Skill execution)
+    task = asyncio.ensure_future(client.connect())
+    await asyncio.wait_for(got.wait(), timeout=30)
+    await client.disconnect()
+    task.cancel()
 
-Hub responds:
-  speak {utterance: "..."}
-```
-
-### Binary Audio Stream
-
-```
-Client sends:
-  MSG_BINARY {bin_type: BIN_RAW_AUDIO, data: <audio_frame>}
-
-Hub processes:
-  (If STT configured, transcribes audio)
-
-Hub responds:
-  (Intent matching and skill execution as above)
+asyncio.run(main())
 ```
 
-## Next Steps
+A `speak` line means handshake, encryption, send and receive all worked against
+a real hub.
 
-- **Performance testing** — Test with large payloads, multiple concurrent messages
-- **Stress testing** — Rapid connect/disconnect cycles, long idle periods
-- **Error recovery** — Network interruption simulation, server restart during connection
-- **Encoding testing** — Verify all 7 encodings work with real hub (e.g., JSON-B64, JSON-Z85B)
+### On-device (MicroPython) test
+
+A true on-device end-to-end run is **not CI-feasible** (it needs flashed
+hardware and a hub on the LAN), so it is a manual checklist:
+
+1. Flash MicroPython 1.20+ to the board (ESP32 / Pico W).
+2. `mpremote mip install github:JarbasHiveMind/hivemind-micropython-client`
+   (and `mpremote mip install github:org/z85base91` only if you need the
+   Z85/B91 encodings).
+3. Bring up Wi-Fi, then run `examples/text_satellite.py` with your hub address
+   and credentials.
+4. Expect the first connect to take ~10-30 s — pure-Python PBKDF2 (100k
+   iterations) is slow. Freeze a `_hivemind_crypto` C module into the firmware
+   for production to cut this to a few seconds.
+
+Watch the hub logs for the satellite's `HELLO` and the `recognizer_loop:utterance`
+it forwards.
+
+## Expected message flow
+
+```
+Client                          Hub (hivemind-core)
+  │ ── ws connect (auth hdr) ──→ │
+  │ ←─ HELLO (pubkey, node_id) ─ │
+  │ ←─ SHAKE (request, ciphers) ─│
+  │ ── SHAKE (hsub envelope) ──→ │   PBKDF2(password, salt=IV⊕IV, 100k) → key
+  │ ←─ SHAKE (cipher/encoding) ──│
+  │ ── HELLO (encrypted) ──────→ │   ready
+  │ ── bus: utterance (enc) ───→ │
+  │ ←─ bus: speak (enc) ───────  │
+  │ ←─ ping (enc) ──────────────│
+  │ ── pong (enc) ─────────────→ │
+```

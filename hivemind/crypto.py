@@ -65,6 +65,32 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
+# Canonical cipher identifiers (must match hivemind-bus-client SupportedCiphers)
+# ---------------------------------------------------------------------------
+
+# These string values are sent on the wire during cipher negotiation and MUST
+# byte-match hivemind_bus_client.encryption.SupportedCiphers, which the hub
+# uses verbatim. In particular ChaCha20 is upper-case with no "Poly" casing.
+CIPHER_AES_GCM = "AES-GCM"
+CIPHER_CHACHA20 = "CHACHA20-POLY1305"
+
+
+def _norm_cipher(cipher: str) -> str:
+    """Normalise a cipher identifier to its canonical wire value.
+
+    Accepts the canonical names plus common alternate spellings (e.g. the
+    older ``"ChaCha20-Poly1305"``) so callers cannot accidentally send a
+    string the hub will reject.
+    """
+    c = cipher.upper().replace("_", "-")
+    if c == CIPHER_AES_GCM:
+        return CIPHER_AES_GCM
+    if c in (CIPHER_CHACHA20, "CHACHA20", "CHACHA20-POLY1305"):
+        return CIPHER_CHACHA20
+    raise ValueError("Unsupported cipher: {}".format(cipher))
+
+
+# ---------------------------------------------------------------------------
 # SHA-256 wrapper
 # ---------------------------------------------------------------------------
 
@@ -240,21 +266,38 @@ class AesGcm:
                 v ^= R
         return z
 
+    @staticmethod
+    def _pad16(d: bytes) -> bytes:
+        """Zero-pad *d* up to a 16-byte boundary."""
+        r = len(d) % 16
+        return d + b"\x00" * ((16 - r) % 16) if r else d
+
     def _ghash(self, h_int: int, aad: bytes, ciphertext: bytes) -> bytes:
         """Compute GHASH over *aad* and *ciphertext* with hash sub-key *h_int*."""
-
-        def _pad16(d: bytes) -> bytes:
-            r = len(d) % 16
-            return d + b"\x00" * ((16 - r) % 16) if r else d
-
-        data = _pad16(aad) + _pad16(ciphertext)
+        data = self._pad16(aad) + self._pad16(ciphertext)
         data += struct.pack(">QQ", len(aad) * 8, len(ciphertext) * 8)
+        return self._ghash_blocks(h_int, data)
 
+    def _ghash_blocks(self, h_int: int, data: bytes) -> bytes:
+        """Raw GHASH over already-padded 16-byte-aligned *data*."""
         y = 0
         for i in range(0, len(data), 16):
             block = int.from_bytes(data[i : i + 16], "big")
             y = self._gf_mult(y ^ block, h_int)
         return y.to_bytes(16, "big")
+
+    def _compute_j0(self, h_int: int, nonce: bytes) -> bytes:
+        """Compute the pre-counter block J0 per NIST SP 800-38D.
+
+        For a 96-bit (12-byte) nonce, J0 = nonce || 0x00000001. For any other
+        nonce length, J0 = GHASH_H(nonce padded || 0^64 || len(nonce)_64).
+        hivemind-bus-client / PyCryptodome use a 16-byte nonce, which takes the
+        GHASH-derived path — so this must be correct for interop with the hub.
+        """
+        if len(nonce) == 12:
+            return nonce + b"\x00\x00\x00\x01"
+        data = self._pad16(nonce) + struct.pack(">QQ", 0, len(nonce) * 8)
+        return self._ghash_blocks(h_int, data)
 
     # -- public API -------------------------------------------------------
 
@@ -263,8 +306,7 @@ class AesGcm:
         h = self._aes_ecb_encrypt(b"\x00" * 16)
         h_int = int.from_bytes(h, "big")
 
-        # J0: use first 12 bytes of nonce as IV
-        j0 = nonce[:12] + b"\x00\x00\x00\x01"
+        j0 = self._compute_j0(h_int, nonce)
 
         ciphertext = self._gctr(self._inc32(j0), plaintext)
         ghash_val = self._ghash(h_int, b"", ciphertext)
@@ -281,7 +323,7 @@ class AesGcm:
         h = self._aes_ecb_encrypt(b"\x00" * 16)
         h_int = int.from_bytes(h, "big")
 
-        j0 = nonce[:12] + b"\x00\x00\x00\x01"
+        j0 = self._compute_j0(h_int, nonce)
 
         ghash_val = self._ghash(h_int, b"", ciphertext)
         expected_tag = self._gctr(j0, ghash_val)
@@ -585,11 +627,12 @@ def encrypt_json(
     The JSON object contains ``ciphertext``, ``tag``, and ``nonce`` keys,
     text-encoded according to *encoding*.
 
-    Supported *cipher* values: ``"AES-GCM"`` and ``"ChaCha20-Poly1305"``.
+    Supported *cipher* values: ``"AES-GCM"`` and ``"CHACHA20-POLY1305"``.
     Supported *encoding* values: ``"JSON-HEX"``, ``"JSON-B64"``,
     ``"JSON-URLSAFE-B64"``, ``"JSON-B32"``, ``"JSON-Z85B"``,
     ``"JSON-Z85P"``, ``"JSON-B91"``.
     """
+    cipher = _norm_cipher(cipher)
     if cipher == "AES-GCM":
         if _HAVE_C_MODULE:
             ct, tag, nonce = aes_gcm_encrypt(key, plaintext)
@@ -600,7 +643,7 @@ def encrypt_json(
         else:
             nonce = randbytes(AesGcm.NONCE_SIZE)
             ct, tag = AesGcm(key).encrypt(plaintext, nonce)
-    elif cipher == "ChaCha20-Poly1305":
+    elif cipher == "CHACHA20-POLY1305":
         if _HAVE_C_MODULE:
             ct, tag, nonce = _c_chacha_encrypt(key, plaintext)
         elif _HAVE_CRYPTOGRAPHY:
@@ -610,8 +653,8 @@ def encrypt_json(
         else:
             nonce = randbytes(ChaCha20Poly1305.NONCE_SIZE)
             ct, tag = ChaCha20Poly1305(key).encrypt(plaintext, nonce)
-    else:
-        raise ValueError(f"Unsupported cipher: {cipher}")
+    else:  # unreachable: _norm_cipher already validated
+        raise ValueError("Unsupported cipher: {}".format(cipher))
 
     encode = get_encoder(encoding)
 
@@ -638,6 +681,7 @@ def decrypt_json(
 
     Raises ``ValueError`` on authentication failure or bad input.
     """
+    cipher = _norm_cipher(cipher)
     obj = json.loads(json_str)
     decode = get_decoder(encoding)
 
@@ -655,14 +699,14 @@ def decrypt_json(
         if _HAVE_CRYPTOGRAPHY:
             return AESGCM(key).decrypt(nonce, ct + tag, None)
         return AesGcm(key).decrypt(ct, nonce, tag)
-    elif cipher == "ChaCha20-Poly1305":
+    elif cipher == "CHACHA20-POLY1305":
         if _HAVE_C_MODULE:
             return _c_chacha_decrypt(key, ct, tag, nonce)
         if _HAVE_CRYPTOGRAPHY:
             return _CPyChaCha(key).decrypt(nonce, ct + tag, None)
         return ChaCha20Poly1305(key).decrypt(ct, nonce, tag)
-    else:
-        raise ValueError(f"Unsupported cipher: {cipher}")
+    else:  # unreachable: _norm_cipher already validated
+        raise ValueError("Unsupported cipher: {}".format(cipher))
 
 
 # Backwards-compatible aliases
