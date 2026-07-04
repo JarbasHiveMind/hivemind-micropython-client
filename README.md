@@ -110,6 +110,25 @@ Client                          Hub
 
 The session key is `PBKDF2(password)` mixed with the two 8-byte IVs exchanged in the handshake. Both ciphers and all encodings are byte-for-byte compatible with `hivemind-core` and the reference `hivemind-websocket-client`.
 
+### Protocol v3 (Noise handshake)
+
+When the hub advertises protocol version 3 and a 32-byte PSK is provisioned, the client runs a **Noise handshake** (`Noise_XXpsk2_25519_ChaChaPoly_SHA256`, or `Noise_KKpsk0` when the server's static key is pinned) instead of the legacy exchange above. It adds mutual authentication, forward secrecy, replay resistance, and downgrade protection; all session traffic then flows as Noise transport frames with implicit counter nonces. Without a PSK (or against a v2 hub) the legacy v0–v2 handshake is used unchanged.
+
+A microcontroller never derives the PSK on-device (argon2id is infeasible there): compute it once on a capable host — `argon2id(password, SHA-256(node_id))`, e.g. via `hivemind-core derive-psk` — and pass the 32 bytes as `psk`:
+
+```python
+client = HiveMindClient(
+    host="192.168.1.10", port=5678,
+    username="satellite", access_key="...", password="...",
+    psk=bytes.fromhex("<64-hex-char provisioned PSK>"),
+    # optional, enables KKpsk0 + TOFU pinning:
+    # server_noise_key=bytes.fromhex("<server static X25519 pubkey>"),
+    # noise_static_key=bytes.fromhex("<this node's static X25519 privkey>"),
+)
+```
+
+After an `XXpsk2` handshake the server's static key is available in `client.server_noise_key` — persist it and pass it back as `server_noise_key` so later connections pin it (a mismatch then aborts as a possible man-in-the-middle).
+
 ## Configuration
 
 `HiveMindClient(...)` parameters:
@@ -125,10 +144,15 @@ The session key is `PBKDF2(password)` mixed with the two 8-byte IVs exchanged in
 | `preferred_cipher` | `"AES-GCM"` or `"CHACHA20-POLY1305"` | `"AES-GCM"` |
 | `preferred_encoding` | One of the 7 JSON encodings (see docs) | `"JSON-HEX"` |
 | `reconnect_ms` | Reconnect delay after a drop | `5000` |
+| `psk` | Provisioned 32-byte Noise PSK (bytes or hex) — enables protocol v3 | `None` |
+| `noise_static_key` | This node's static X25519 private key (bytes or hex) | generated |
+| `server_noise_key` | Pinned server static X25519 public key (bytes or hex) | `None` |
+| `max_protocol_version` | Highest protocol version to offer (`2` forces legacy) | `3` |
 
 ## Troubleshooting
 
 - **First connection takes 10-30 s on ESP32** — pure-Python PBKDF2 at 100k iterations is slow. This is expected; for production, freeze the `_hivemind_crypto` C module into the firmware (handshake drops to ~2-3 s).
+- **Protocol v3 handshake is slow on-device** — pure-Python X25519 takes seconds per DH operation on an ESP32 (XXpsk2 does 3, plus key generation). It only runs once per connection; transport encryption afterwards is ChaCha20-Poly1305, the fastest pure-Python option.
 - **`MemoryError` on device** — send audio in small chunks and call `gc.collect()`; consider a more compact encoding.
 - **Authentication / handshake failures** — verify `username`, `access_key`, and `password` match the credential registered on the hub.
 - **Connection refused** — confirm the hub is listening and reachable at `host:port`.

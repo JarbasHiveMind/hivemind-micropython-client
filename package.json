@@ -3,6 +3,7 @@
         ["hivemind/__init__.py", "github:JarbasHiveMind/hivemind-micropython-client/hivemind/__init__.py"],
         ["hivemind/client.py", "github:JarbasHiveMind/hivemind-micropython-client/hivemind/client.py"],
         ["hivemind/crypto.py", "github:JarbasHiveMind/hivemind-micropython-client/hivemind/crypto.py"],
+        ["hivemind/noise.py", "github:JarbasHiveMind/hivemind-micropython-client/hivemind/noise.py"],
         ["hivemind/binary.py", "github:JarbasHiveMind/hivemind-micropython-client/hivemind/binary.py"]
     ],
     "version": "0.1.0"

@@ -85,7 +85,7 @@ class TestKeyDerivationConformance(unittest.TestCase):
 
     def test_derive_key_matches_reference(self):
         """salt = XOR(client_iv, server_iv); PBKDF2-HMAC-SHA256 100k -> 32B."""
-        password = "hunter2"
+        password = "correct horse battery staple 42!"
         # Reference: two peers each pick an IV, derive identical secret.
         client = PasswordHandShake(password)
         server = PasswordHandShake(password)

@@ -472,11 +472,20 @@ class ChaCha20Poly1305:
 
     # -- public API -------------------------------------------------------
 
-    def encrypt(self, plaintext: bytes, nonce: bytes) -> Tuple[bytes, bytes]:
-        """Encrypt *plaintext* with *nonce*. Returns ``(ciphertext, tag)``."""
+    def encrypt(
+        self,
+        plaintext: bytes,
+        nonce: bytes,
+        aad: bytes = b"",
+    ) -> Tuple[bytes, bytes]:
+        """Encrypt *plaintext* with *nonce* and optional *aad*.
+
+        Returns ``(ciphertext, tag)``. The Poly1305 tag authenticates both
+        the additional data and the ciphertext (RFC 8439 §2.8).
+        """
         poly_key = self._chacha20_block(self._key, 0, nonce)[:32]
         ciphertext = self._chacha20_encrypt(self._key, 1, nonce, plaintext)
-        tag = self._poly1305_aead(poly_key, b"", ciphertext)
+        tag = self._poly1305_aead(poly_key, aad, ciphertext)
         return (ciphertext, tag)
 
     def decrypt(
@@ -484,10 +493,11 @@ class ChaCha20Poly1305:
         ciphertext: bytes,
         nonce: bytes,
         tag: bytes,
+        aad: bytes = b"",
     ) -> bytes:
         """Decrypt *ciphertext*. Raises ``ValueError`` on auth failure."""
         poly_key = self._chacha20_block(self._key, 0, nonce)[:32]
-        expected_tag = self._poly1305_aead(poly_key, b"", ciphertext)
+        expected_tag = self._poly1305_aead(poly_key, aad, ciphertext)
         if expected_tag != tag:
             raise ValueError("ChaCha20-Poly1305 authentication failed")
         return self._chacha20_encrypt(self._key, 1, nonce, ciphertext)
