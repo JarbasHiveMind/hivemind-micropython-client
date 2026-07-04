@@ -27,7 +27,7 @@ from hivemind_bus_client.encryption import (
 
 from hivemind.client import HiveMindClient
 
-_PASSWORD = "test-password"
+_PASSWORD = "correct horse battery staple 42!"
 _CIPHER = SupportedCiphers.AES_GCM
 _ENCODING = SupportedEncodings.JSON_HEX
 _CIPHER_WIRE = "AES-GCM"

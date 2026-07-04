@@ -43,6 +43,16 @@ from hivemind.crypto import (
     _norm_cipher,
 )
 from hivemind.binary import encode as binary_encode, decode as binary_decode
+from hivemind.noise import (
+    PROTOCOL_V3,
+    NoiseHandshake,
+    NoiseHandshakeError,
+    NoiseTransport,
+    build_prologue,
+    canonical_json,
+    noise_protocol_name,
+    select_noise_options,
+)
 
 # ---------------------------------------------------------------------------
 # Connection states
@@ -106,7 +116,34 @@ class HiveMindClient:
         preferred_cipher: str = CIPHER_AES_GCM,
         preferred_encoding: str = "JSON-HEX",
         reconnect_ms: int = 5000,
+        psk: Optional[bytes] = None,
+        noise_static_key: Optional[bytes] = None,
+        server_noise_key: Optional[bytes] = None,
+        max_protocol_version: int = PROTOCOL_V3,
     ) -> None:
+        """
+        Args:
+            psk: The **provisioned** 32-byte Noise pre-shared key
+                (HIVEMIND-CRYPTO-1 §3.4.4) — 32 raw bytes or a 64-char hex
+                string. Constrained nodes never derive it on-device (argon2id
+                is infeasible on a microcontroller): compute it once on a
+                capable host (``hivemind-core derive-psk``, equal to
+                ``argon2id(password, SHA-256(node_id))``). Enables the
+                protocol v3 Noise handshake when the server offers it;
+                without it the legacy v0-v2 handshake is used.
+            noise_static_key: This node's static X25519 private key (32 raw
+                bytes or hex). Generated per-connection when omitted;
+                provision + persist it for a stable node identity and to use
+                ``KKpsk0``.
+            server_noise_key: The server's static X25519 public key (32 raw
+                bytes or hex), pinned/provisioned out of band. Selects the
+                ``KKpsk0`` pattern when the server offers it and makes any
+                key mismatch a fatal authentication failure (TOFU pinning,
+                §3.4.5). After an ``XXpsk2`` handshake the learned key is
+                stored here for the caller to persist.
+            max_protocol_version: Highest protocol version this client
+                offers (default 3). Set to 2 to force the legacy handshake.
+        """
         self.host: str = host
         self.port: int = port
         self.username: str = username
@@ -127,6 +164,20 @@ class HiveMindClient:
         self._client_hsub: Optional[str] = None
         self._session_id: Optional[str] = None
         self._ws: object = None  # WebSocket connection (type varies by platform)
+
+        # protocol v3 (Noise) state
+        def _to_bytes(val):
+            return bytes.fromhex(val) if isinstance(val, str) else val
+
+        self.psk: Optional[bytes] = _to_bytes(psk)
+        if self.psk is not None and len(self.psk) != 32:
+            raise ValueError("psk must be exactly 32 bytes")
+        self.noise_static_key: Optional[bytes] = _to_bytes(noise_static_key)
+        self.server_noise_key: Optional[bytes] = _to_bytes(server_noise_key)
+        self.max_protocol_version: int = max_protocol_version
+        self._server_hello_payload: Optional[dict] = None
+        self._noise_handshake: Optional[NoiseHandshake] = None
+        self._noise_transport: Optional[NoiseTransport] = None
 
         # Callbacks
         self.on_bus_message: Optional[Callable[[str, dict, dict], None]] = None
@@ -170,8 +221,9 @@ class HiveMindClient:
 
     # -- transport ----------------------------------------------------------
 
-    async def _send(self, data: str) -> None:
-        """Send a text frame over the websocket."""
+    async def _send(self, data) -> None:
+        """Send a text (``str``) or binary (``bytes``) frame over the
+        websocket."""
         if self._ws is None:
             raise ConnectionError("WebSocket not connected")
         if _MICROPYTHON:
@@ -180,10 +232,18 @@ class HiveMindClient:
             await self._ws.send(data)  # type: ignore[union-attr]
 
     async def _send_encrypted(self, msg_type: str, payload: dict) -> None:
-        """Encrypt an envelope and send it over the websocket."""
+        """Encrypt an envelope and send it over the websocket.
+
+        On a protocol v3 session every message is a Noise transport message
+        (HIVEMIND-CRYPTO-1 §3.4.5); otherwise the legacy v0-v2 session
+        cipher is used.
+        """
+        envelope = self._build_envelope(msg_type, payload)
+        if self._noise_transport is not None:
+            await self._send(self._noise_transport.encrypt_frame(envelope))
+            return
         if self._key is None or self._cipher is None:
             raise RuntimeError("Session key not established")
-        envelope = self._build_envelope(msg_type, payload)
         encrypted = encrypt_json(self._key, envelope.encode(), self._cipher, self._encoding)
         await self._send(encrypted)
 
@@ -224,6 +284,9 @@ class HiveMindClient:
             self._ws = None
             self._key = None
             self._cipher = None
+            self._noise_handshake = None
+            self._noise_transport = None
+            self._server_hello_payload = None
             self._set_state(STATE_DISCONNECTED)
 
     async def _reconnect(self) -> None:
@@ -244,15 +307,21 @@ class HiveMindClient:
                     raw = self._ws.readline()  # type: ignore[union-attr]
                     if raw is None:
                         break
-                    raw = raw.decode() if isinstance(raw, bytes) else raw
                 else:
                     raw = await self._ws.recv()  # type: ignore[union-attr]
                     if raw is None:
                         break
 
                 if self.state < STATE_READY:
+                    # handshake-phase envelopes are always JSON text
+                    if isinstance(raw, bytes):
+                        raw = raw.decode()
                     await self._handle_handshake(raw)
                 else:
+                    # protocol v3 transport frames arrive as binary; legacy
+                    # sessions use text frames
+                    if isinstance(raw, bytes) and self._noise_transport is None:
+                        raw = raw.decode()
                     await self._dispatch_message(raw)
         except Exception:
             pass
@@ -283,12 +352,18 @@ class HiveMindClient:
             self._server_pubkey: str = payload.get("pubkey", "")
             self._server_peer: str = payload.get("peer", "")
             self._server_node_id: str = payload.get("node_id", "")
+            # exact payload retained for the Noise prologue (§3.4.3)
+            self._server_hello_payload = dict(payload)
             self._set_state(STATE_HELLO_RECEIVED)
 
         elif self.state == STATE_HELLO_RECEIVED and msg_type == "shake":
             if not payload.get("handshake"):
                 return
-            # Generate client hsub
+            if self._should_use_noise(payload):
+                # protocol v3: Noise handshake (HIVEMIND-CRYPTO-1 §3.4)
+                await self._start_noise_handshake(payload)
+                return
+            # legacy v0-v2 password handshake: generate client hsub
             iv, hsub_hex = generate_hsub(self.password)
             self._client_iv = iv
             self._client_hsub = hsub_hex
@@ -301,6 +376,11 @@ class HiveMindClient:
             })
             await self._send(response)
             self._set_state(STATE_HANDSHAKE_SENT)
+
+        elif (self.state == STATE_HANDSHAKE_SENT and msg_type == "shake"
+              and self._noise_handshake is not None):
+            # protocol v3: server's Noise handshake message (§3.4.3 step 4)
+            await self._receive_noise_handshake(payload)
 
         elif self.state == STATE_HANDSHAKE_SENT and msg_type == "shake":
             # Derive session key from server hsub
@@ -325,18 +405,164 @@ class HiveMindClient:
             if self.on_connected is not None:
                 self.on_connected()
 
-    # -- message dispatch ---------------------------------------------------
+    # -- protocol v3 (Noise) handshake ----------------------------------------
 
-    async def _dispatch_message(self, raw: str) -> None:
-        """Decrypt and dispatch a message received in READY state."""
-        if self._key is None or self._cipher is None:
+    def _should_use_noise(self, payload: dict) -> bool:
+        """True when both peers are v3-capable and a PSK is provisioned.
+
+        Per HIVEMIND-WIRE-1 §2 both peers operate at the highest protocol
+        version both support: the server must advertise
+        ``max_protocol_version`` >= 3 together with Noise
+        ``patterns``/``suites`` this client can run (ChaChaPoly), and a
+        32-byte PSK must be provisioned (§3.4.4 — never derived on-device).
+        Any other combination falls back to the legacy v0-v2 handshake.
+        """
+        if self.psk is None or self.max_protocol_version < PROTOCOL_V3:
+            return False
+        if payload.get("max_protocol_version", 1) < PROTOCOL_V3:
+            return False
+        noise_params = payload.get("noise")
+        if not isinstance(noise_params, dict):
+            return False
+        return select_noise_options(noise_params.get("patterns") or [],
+                                    noise_params.get("suites") or [],
+                                    self.server_noise_key) is not None
+
+    async def _start_noise_handshake(self, payload: dict) -> None:
+        """Send Noise message 1 (HIVEMIND-CRYPTO-1 §3.4.3 step 3).
+
+        Selects one pattern and one suite from the server's advertised
+        lists, binds the negotiation into the prologue, and carries the
+        Noise message bytes inside the regular HANDSHAKE envelope.
+        """
+        noise_params = payload.get("noise") or {}
+        pattern, suite = select_noise_options(
+            noise_params.get("patterns") or [],
+            noise_params.get("suites") or [],
+            self.server_noise_key)
+        name = noise_protocol_name(pattern, suite)
+        prologue = build_prologue(self._server_hello_payload or {},
+                                  payload, name)
+        try:
+            self._noise_handshake = NoiseHandshake(
+                pattern=pattern,
+                psk=self.psk,
+                prologue=prologue,
+                suite=suite,
+                static_private=self.noise_static_key,
+                remote_static=self.server_noise_key if pattern == "KKpsk0" else None,
+            )
+            # Noise payload of message 1: preference-ordered encodings +
+            # binarize capability (§3.4.3 step 3)
+            msg1 = self._noise_handshake.write_message(canonical_json({
+                "binarize": False,
+                "encodings": [self.preferred_encoding],
+            }))
+        except NoiseHandshakeError:
+            await self._abort_noise()
             return
+        response = self._build_envelope("shake", {
+            "noise": {"pattern": pattern, "suite": suite,
+                      "msg": msg1.hex()},
+        })
+        await self._send(response)
+        self._set_state(STATE_HANDSHAKE_SENT)
+
+    async def _receive_noise_handshake(self, payload: dict) -> None:
+        """Consume the server's Noise message (§3.4.3 steps 4-7).
+
+        Any authentication failure — wrong PSK (password), tampered
+        negotiation (prologue mismatch), or a static key contradicting the
+        pinned key — is fatal: the handshake aborts and the connection is
+        rejected. On success the two transport CipherStates take over all
+        session traffic and the encrypted HELLO is sent as the first Noise
+        transport message.
+        """
+        try:
+            msg = bytes.fromhex((payload.get("noise") or {}).get("msg", ""))
+        except (TypeError, ValueError):
+            await self._abort_noise()
+            return
+        try:
+            noise_payload = self._noise_handshake.read_message(msg)
+            if not self._noise_handshake.finished:
+                # XXpsk2 message 3: our (encrypted) static key + final DH mix
+                msg3 = self._noise_handshake.write_message(b"")
+                await self._send(self._build_envelope(
+                    "shake", {"noise": {"msg": msg3.hex()}}))
+            transport = NoiseTransport(self._noise_handshake)
+        except NoiseHandshakeError:
+            await self._abort_noise()
+            return
+
+        # TOFU-then-pin the server's static key (§3.4.5): abort on mismatch,
+        # expose the learned key so the caller can persist the pin
+        if (self.server_noise_key
+                and transport.remote_static_key != self.server_noise_key):
+            await self._abort_noise()
+            return
+        self.server_noise_key = transport.remote_static_key
 
         try:
-            plaintext = decrypt_json(self._key, raw, self._cipher, self._encoding)
-            envelope = json.loads(plaintext)
-        except (ValueError, TypeError, KeyError):
-            return
+            selection = json.loads(noise_payload.decode()) if noise_payload else {}
+        except (ValueError, TypeError):
+            selection = {}
+        self._encoding = selection.get("encoding", self.preferred_encoding)
+
+        self._noise_transport = transport
+        self._noise_handshake = None
+        self._set_state(STATE_KEY_DERIVED)
+
+        # first Noise transport message: the encrypted HELLO (§3.4.3 step 7)
+        await self._send_encrypted("hello", {
+            "pubkey": "",
+            "session": {"session_id": self._session_id},
+            "site_id": self.site_id,
+        })
+        self._set_state(STATE_READY)
+
+        if self.on_connected is not None:
+            self.on_connected()
+
+    async def _abort_noise(self) -> None:
+        """Fatal Noise handshake failure — reject the connection (§3.4.3)."""
+        self._noise_handshake = None
+        self._noise_transport = None
+        await self.disconnect()
+
+    # -- message dispatch ---------------------------------------------------
+
+    async def _dispatch_message(self, raw) -> None:
+        """Decrypt and dispatch a message received in READY state."""
+        if self._noise_transport is not None:
+            # protocol v3: every message is a Noise transport message; any
+            # AEAD failure (tampering / replay / reordering) is fatal and is
+            # never retried under another nonce (§3.4.5)
+            try:
+                if isinstance(raw, str):
+                    raw = raw.encode()
+                frame = self._noise_transport.decrypt_frame(bytes(raw))
+            except (ValueError, TypeError):
+                await self.disconnect()
+                return
+            if isinstance(frame, bytes):
+                # HIVEMIND-WIRE-1 binary frame
+                if self.on_binary is not None:
+                    decoded = binary_decode(frame)
+                    self.on_binary(decoded["bin_type"], decoded["payload"])
+                return
+            try:
+                envelope = json.loads(frame)
+            except (ValueError, TypeError):
+                return
+        else:
+            if self._key is None or self._cipher is None:
+                return
+            try:
+                plaintext = decrypt_json(self._key, raw, self._cipher, self._encoding)
+                envelope = json.loads(plaintext)
+            except (ValueError, TypeError, KeyError):
+                return
 
         msg_type: str = envelope.get("msg_type", "")
         payload: dict = envelope.get("payload", {})
@@ -402,7 +628,10 @@ class HiveMindClient:
             data: Raw binary payload.
         """
         encoded = binary_encode(MSG_BINARY, bin_type, b"{}", data)
-        if self._key is not None and self._cipher is not None:
+        if self._noise_transport is not None:
+            # protocol v3: binary-marker Noise transport frame (§3.4.5)
+            await self._send(self._noise_transport.encrypt_frame(encoded))
+        elif self._key is not None and self._cipher is not None:
             encrypted = encrypt_json(self._key, encoded, self._cipher, self._encoding)
             await self._send(encrypted)
         else:

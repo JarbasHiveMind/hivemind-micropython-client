@@ -13,7 +13,9 @@
 # minimum version so pip resolves them without --pre.
 hivemind-bus-client>=0.9.2a1
 ovos-bus-client>=2.0.0a3
-poorman_handshake>=0.2.0
+# >=1.0.2a5 for poorman_handshake.noise, the protocol-v3 Noise reference the
+# interop tests validate against (fixture generation + mock hub responder)
+poorman_handshake>=1.0.2a5
 z85base91>=0.0.6a6
 cryptography
 websockets
