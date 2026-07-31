@@ -64,3 +64,6 @@ Some MicroPython builds do not support this import. Use a build that does, or a 
 ## More questions
 
 See [`FAQ.md`](../FAQ.md) for short answers about backends, ciphers, and the binary frame format.
+
+---
+[← Examples](examples.md) · [Home](../README.md) · [Integration testing →](integration-testing.md)

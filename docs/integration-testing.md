@@ -1,8 +1,8 @@
 # Integration & Conformance Testing
 
 This client is tested at two levels. The first runs in CI on every PR with no
-board and no network; the second is a manual procedure against a real hub and
-(optionally) real hardware.
+board and no network. The second is a manual procedure against a real hub and,
+optionally, real hardware.
 
 ## 1. Automated tests (CI, no hub, no board)
 
@@ -17,14 +17,14 @@ PYTHONPATH="$PWD" pytest test/ -v
 
 | File | What it proves |
 |------|----------------|
-| `test_crypto.py` | AES-GCM / ChaCha20-Poly1305 and all JSON encodings round-trip; HMAC/PBKDF2 against RFC vectors. |
+| `test_crypto.py` | AES-GCM / ChaCha20-Poly1305 and all JSON encodings round-trip, plus HMAC/PBKDF2 against RFC vectors. |
 | `test_binary.py` | The bitstring binary codec round-trips for every message type. |
-| `test_conformance.py` | Byte-for-byte Protocol-V1 interop **against the reference `hivemind-bus-client`**: key derivation, hsub format, cipher/encoding wire strings, AES-GCM/ChaCha20 ciphertext (both the CPython `cryptography` path **and** the pure-Python on-device path), and binary framing. |
-| `test_integration.py` | A full **password handshake + encrypted message round-trip** where the hub side is the real reference protocol code driven over an in-process mock WebSocket — handshake, encrypted `HELLO`, utterance/`speak`, and `PING`/`PONG`. |
+| `test_conformance.py` | Byte-for-byte Protocol-V1 interop **against the reference `hivemind-bus-client`**. Covers key derivation, hsub format, cipher/encoding wire strings, AES-GCM/ChaCha20 ciphertext (both the CPython `cryptography` path and the pure-Python on-device path), and binary framing. |
+| `test_integration.py` | A full **password handshake and encrypted message round-trip**. The hub side is the real reference protocol code, driven over an in-process mock WebSocket: handshake, encrypted `HELLO`, utterance/`speak`, and `PING`/`PONG`. |
 
 Because the conformance and integration tests use the genuine reference
 implementation as the other end of the wire, a green run guarantees the client
-speaks Protocol V1 exactly as `hivemind-core` expects — without a running hub.
+speaks Protocol V1 exactly as `hivemind-core` expects, without a running hub.
 
 ### Why the pure-Python crypto path is tested explicitly
 
@@ -37,7 +37,7 @@ derivation for the hub's 16-byte nonce) cannot hide behind the faster backend.
 ## 2. Manual live-hub test
 
 This exercises the real WebSocket transport against a running `hivemind-core`.
-It is **not** in CI (it needs a hub and the OVOS stack); run it locally.
+It is **not** in CI, because it needs a hub and the OVOS stack. Run it locally.
 
 ### Set up a hub
 
@@ -100,7 +100,7 @@ hardware and a hub on the LAN), so it is a manual checklist:
    Z85/B91 encodings).
 3. Bring up Wi-Fi, then run `examples/text_satellite.py` with your hub address
    and credentials.
-4. Expect the first connect to take ~10-30 s — pure-Python PBKDF2 (100k
+4. Expect the first connect to take about 10-30 s: pure-Python PBKDF2 (100k
    iterations) is slow. Freeze a `_hivemind_crypto` C module into the firmware
    for production to cut this to a few seconds.
 
@@ -122,3 +122,6 @@ Client                          Hub (hivemind-core)
   │ ←─ ping (enc) ──────────────│
   │ ── pong (enc) ─────────────→ │
 ```
+
+---
+[← Troubleshooting](troubleshooting.md) · [Home](../README.md)

@@ -1,6 +1,6 @@
 # Examples
 
-Copy-paste patterns for common satellite tasks. Each runs on CPython as-is; on MicroPython, bring up Wi-Fi first (see `examples/text_satellite.py`).
+Copy-paste patterns for common satellite tasks. Each runs on CPython as-is. On MicroPython, bring up Wi-Fi first (see `examples/text_satellite.py`).
 
 ## 1. Send an utterance, receive the spoken reply
 
@@ -100,12 +100,15 @@ The hub makes the final choice during the handshake. The seven encodings trade s
 
 | Encoding | Relative size | Notes |
 | --- | --- | --- |
-| `JSON-HEX` | 200% | Default; simplest |
+| `JSON-HEX` | 200% | Default, simplest |
 | `JSON-B64` | 133% | Standard base64 |
 | `JSON-URLSAFE-B64` | 133% | URL-safe base64 |
 | `JSON-B32` | 160% | Case-insensitive transports |
 | `JSON-Z85B` | 125% | Needs `z85base91` |
 | `JSON-Z85P` | 125% | Needs `z85base91` |
-| `JSON-B91` | 122% | Most compact; needs `z85base91` |
+| `JSON-B91` | 122% | Most compact, needs `z85base91` |
 
 See the runnable [`examples/`](../examples/) for the full text and mic satellites.
+
+---
+[← Getting started](getting-started.md) · [Home](../README.md) · [Troubleshooting →](troubleshooting.md)
