@@ -4,7 +4,7 @@ This guide takes you from a bare microcontroller (or a desktop) to a HiveMind sa
 
 ## What this client does
 
-A HiveMind **satellite** captures input on an edge device and forwards it to a central **hub**. The hub runs the AI reasoning — intent parsing, skills, text-to-speech — and sends responses back. This client implements the satellite side: the encrypted HiveMind handshake and bus/binary messaging, small enough to run on MicroPython.
+A HiveMind **satellite** captures input on an edge device and forwards it to a central **hub**. The hub runs the AI reasoning (intent parsing, skills, text-to-speech) and sends responses back. This client implements the satellite side: the encrypted HiveMind handshake and bus/binary messaging, small enough to run on MicroPython.
 
 ```
 device (this client)  ⇄  hivemind-core hub  ⇄  OVOS skills
@@ -28,7 +28,7 @@ Running this client instead of full OVOS keeps the device footprint tiny: the hu
 - A running HiveMind hub ([hivemind-core](https://github.com/JarbasHiveMind/HiveMind-core)) reachable at a known address and port (default `5678`).
 - A client credential (username, access key, password) registered on the hub.
 
-## Step 1 — Stand up a hub
+## Step 1: Stand up a hub
 
 On a desktop or home server:
 
@@ -39,16 +39,16 @@ hivemind-core listen
 
 The hub listens on port `5678` by default.
 
-## Step 2 — Register the satellite
+## Step 2: Register the satellite
 
 ```bash
 hivemind-core add-client --name esp32 \
   --access-key "your-access-key" --password "your-password"
 ```
 
-Keep the access key and password — the device authenticates with them. List clients with `hivemind-core list-clients`.
+Keep the access key and password. The device uses them to authenticate. List clients with `hivemind-core list-clients`.
 
-## Step 3 — Install the client
+## Step 3: Install the client
 
 ### MicroPython
 
@@ -73,9 +73,9 @@ pip install websockets cryptography   # optional accelerators
 
 Run scripts with the `hivemind/` package on `sys.path`.
 
-## Step 4 — Connect and send a message
+## Step 4: Connect and send a message
 
-On CPython this script runs as-is. On MicroPython, bring up Wi-Fi first — see `examples/text_satellite.py`, which guards the `network` import so the same file runs on both platforms.
+On CPython this script runs as-is. On MicroPython, bring up Wi-Fi first. See `examples/text_satellite.py`, which guards the `network` import so the same file runs on both platforms.
 
 ```python
 import asyncio
@@ -120,3 +120,6 @@ hub says: It is half past three.
 - [Examples](examples.md)
 - [Troubleshooting](troubleshooting.md)
 - [Integration testing against a live hub](integration-testing.md)
+
+---
+[Home](../README.md) · [Examples →](examples.md)
