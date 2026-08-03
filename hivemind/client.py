@@ -80,14 +80,13 @@ MSG_QUERY: int = 7
 MSG_CASCADE: int = 8
 MSG_PING: int = 9
 MSG_RENDEZVOUS: int = 10
-MSG_THIRDPARTY: int = 11
 MSG_BINARY: int = 12
 MSG_PONG: int = 13
 
 _TYPE_NAMES: Dict[int, str] = {
     0: "shake", 1: "bus", 2: "shared_bus", 3: "broadcast",
     4: "propagate", 5: "escalate", 6: "hello", 7: "query",
-    8: "cascade", 9: "ping", 10: "rendezvous", 11: "3rdparty",
+    8: "cascade", 9: "ping", 10: "rendezvous",
     12: "bin", 13: "pong",
 }
 _NAME_TO_TYPE: Dict[str, int] = {v: k for k, v in _TYPE_NAMES.items()}
