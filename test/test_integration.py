@@ -260,9 +260,16 @@ class TestEncryptedMessageRoundTrip(unittest.TestCase):
 
 
 class TestPingPong(unittest.TestCase):
-    """INT-MP-04: the client answers an encrypted PING with a PONG."""
+    """INT-MP-04: the client answers an encrypted PING with a responsive PING.
 
-    def test_ping_is_answered_with_pong(self):
+    There is no PONG message type (HIVEMIND-MSG-1 §4). The answer is this
+    node's own PING carrying the originator's ``flood_id``, PROPAGATE-wrapped,
+    which is what lets the originator match it to the flood it started. The
+    client used to reply with a ``pong`` frame on wire code 13, which is
+    unassigned, so a reference decoder rejected it outright.
+    """
+
+    def test_ping_is_answered_with_a_responsive_ping(self):
         client = HiveMindClient(
             host="mock", port=0, username="u", access_key="k",
             password=_PASSWORD, site_id="mock-sat", reconnect_ms=0,
@@ -284,7 +291,7 @@ class TestPingPong(unittest.TestCase):
                 ping = encrypt_as_json(
                     hub.key,
                     json.dumps({
-                        "msg_type": "ping", "payload": {},
+                        "msg_type": "ping", "payload": {"flood_id": "flood-1"},
                         "metadata": {}, "route": [], "node": None,
                         "target_site_id": None, "target_pubkey": None,
                         "source_peer": None,
@@ -302,12 +309,52 @@ class TestPingPong(unittest.TestCase):
 
         asyncio.run(runner())
 
-        # The client's reply to the ping must be a decryptable pong envelope.
-        pongs = [
-            json.loads(m) for m in hub.received
-            if json.loads(m).get("msg_type") == "pong"
+        sent = [json.loads(m) for m in hub.received]
+
+        # No frame may carry the retired pong type.
+        self.assertEqual(
+            [m for m in sent if m.get("msg_type") == "pong"], [],
+            "client still emits a pong; wire code 13 is unassigned and a "
+            "reference decoder rejects it",
+        )
+
+        # The answer is a PROPAGATE wrapping a PING with the same flood_id.
+        answers = [
+            m for m in sent
+            if m.get("msg_type") == "propagate"
+            and isinstance(m.get("payload"), dict)
+            and m["payload"].get("msg_type") == "ping"
         ]
-        self.assertTrue(pongs, "client did not answer ping with a pong")
+        self.assertTrue(answers, "client did not answer ping with a responsive ping")
+        inner = answers[0]["payload"]["payload"]
+        self.assertEqual(inner.get("flood_id"), "flood-1",
+                         "the answer must carry the originator's flood_id")
+        self.assertEqual(inner.get("site_id"), "mock-sat")
+        self.assertIn("::", inner.get("peer", ""),
+                      "peer should be username::session_id")
+
+    def test_a_repeated_flood_is_answered_once(self):
+        """A flood that arrives twice must not produce two answers, or the
+        originator maps one node as two."""
+        client = HiveMindClient(
+            host="mock", port=0, username="u", access_key="k",
+            password=_PASSWORD, site_id="mock-sat", reconnect_ms=0,
+        )
+        client._seen_flood_ids = []
+        sent = []
+
+        async def fake_send(msg_type, payload):
+            sent.append((msg_type, payload))
+
+        client._send_encrypted = fake_send
+        client._session_id = "sess-1"
+
+        asyncio.run(client._handle_ping({"flood_id": "same"}))
+        asyncio.run(client._handle_ping({"flood_id": "same"}))
+        self.assertEqual(len(sent), 1, "the same flood was answered twice")
+
+        asyncio.run(client._handle_ping({"flood_id": "other"}))
+        self.assertEqual(len(sent), 2, "a new flood must still be answered")
 
 
 if __name__ == "__main__":

@@ -28,6 +28,7 @@ except ImportError:
     _MICROPYTHON = False
 
 import json
+import time
 
 from hivemind.crypto import (
     generate_hsub,
@@ -81,13 +82,18 @@ MSG_CASCADE: int = 8
 MSG_PING: int = 9
 MSG_RENDEZVOUS: int = 10
 MSG_BINARY: int = 12
-MSG_PONG: int = 13
+# Code 11 was THIRDPRTY and is reserved; it must never be reused.
+# There is no PONG message type: a PING is answered with a responsive PING
+# carrying the same flood_id (HIVEMIND-MSG-1 §4, HIVEMIND-NODE-1 §4).
+
+#: How many answered flood ids a constrained node remembers.
+_MAX_SEEN_FLOOD_IDS: int = 64
 
 _TYPE_NAMES: Dict[int, str] = {
     0: "shake", 1: "bus", 2: "shared_bus", 3: "broadcast",
     4: "propagate", 5: "escalate", 6: "hello", 7: "query",
     8: "cascade", 9: "ping", 10: "rendezvous",
-    12: "bin", 13: "pong",
+    12: "bin",
 }
 _NAME_TO_TYPE: Dict[str, int] = {v: k for k, v in _TYPE_NAMES.items()}
 
@@ -162,6 +168,8 @@ class HiveMindClient:
         self._client_iv: Optional[bytes] = None
         self._client_hsub: Optional[str] = None
         self._session_id: Optional[str] = None
+        # flood ids already answered, oldest first (see _handle_ping)
+        self._seen_flood_ids: list = []
         self._ws: object = None  # WebSocket connection (type varies by platform)
 
         # protocol v3 (Noise) state
@@ -531,6 +539,43 @@ class HiveMindClient:
 
     # -- message dispatch ---------------------------------------------------
 
+    async def _handle_ping(self, payload: dict) -> None:
+        """Answer a PING with this node's own responsive PING.
+
+        HIVEMIND-MSG-1 §4: discovery is PING-only and there is no PONG. The
+        answer reuses the originator's ``flood_id`` and is PROPAGATE-wrapped,
+        which is what lets the originator match it to the flood it started.
+
+        Answer each flood once. Without that, a flood that reaches this node
+        over two paths is answered twice and the originator maps one node as
+        two.
+        """
+        flood_id = payload.get("flood_id", "")
+        if not flood_id or flood_id in self._seen_flood_ids:
+            return
+        self._seen_flood_ids.append(flood_id)
+        # Bounded: a constrained node cannot grow this without limit, and the
+        # oldest id is the one least likely to still be in flight.
+        while len(self._seen_flood_ids) > _MAX_SEEN_FLOOD_IDS:
+            self._seen_flood_ids.pop(0)
+
+        own_ping = {
+            "msg_type": "ping",
+            "payload": {
+                "flood_id": flood_id,
+                "peer": f"{self.username}::{self._session_id}",
+                "site_id": self.site_id,
+                "timestamp": time.time(),
+            },
+            "metadata": {},
+            "route": [],
+            "node": None,
+            "target_site_id": None,
+            "target_pubkey": None,
+            "source_peer": None,
+        }
+        await self._send_encrypted("propagate", own_ping)
+
     async def _dispatch_message(self, raw) -> None:
         """Decrypt and dispatch a message received in READY state."""
         if self._noise_transport is not None:
@@ -567,7 +612,7 @@ class HiveMindClient:
         payload: dict = envelope.get("payload", {})
 
         if msg_type == "ping":
-            await self._send_encrypted("pong", {})
+            await self._handle_ping(payload)
 
         elif msg_type in ("bus", "shared_bus", "broadcast", "propagate",
                           "escalate", "query", "cascade"):
