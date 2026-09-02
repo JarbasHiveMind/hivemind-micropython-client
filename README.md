@@ -1,5 +1,10 @@
 # hivemind-micropython-client
 
+> **Experimental — not yet tested on hardware.** This client was written without a
+> device in the loop. It has not run on a physical microcontroller yet. Treat it as
+> a starting point, not a finished product. Test it on your own hardware before you
+> rely on it, and please report what breaks.
+
 Lightweight [HiveMind](https://github.com/JarbasHiveMind/HiveMind-core) satellite client for MicroPython 1.20+ and CPython 3.10+, from one shared pure-Python codebase.
 
 A **satellite** is an edge device that captures user input (text, audio, sensors) and forwards it to a central **hub** ([hivemind-core](https://github.com/JarbasHiveMind/HiveMind-core)). The hub runs the AI reasoning (intent parsing, skills, TTS) and sends responses back. This client runs the full HiveMind handshake and encrypted messaging on a microcontroller. That lets an ESP32 or Raspberry Pi Pico act as a satellite without running OVOS on-device.
