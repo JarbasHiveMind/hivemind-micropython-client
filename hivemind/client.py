@@ -58,6 +58,16 @@ from hivemind.noise import (
     noise_protocol_name,
     select_noise_options,
 )
+from hivemind.version import VERSION
+
+
+class LegacyHandshakeRejected(Exception):
+    """The hub cannot complete the mandatory Noise handshake and
+    ``legacy_hub`` was not set (HIVEMIND-CRYPTO-1 §3, §5)."""
+
+
+#: Next major release: the legacy v0-v2 password handshake is removed then.
+LEGACY_HANDSHAKE_REMOVAL_VERSION: str = "%d.0.0" % (VERSION[0] + 1)
 
 # ---------------------------------------------------------------------------
 # Connection states
@@ -129,6 +139,7 @@ class HiveMindClient:
         noise_static_key: Optional[bytes] = None,
         server_noise_key: Optional[bytes] = None,
         max_protocol_version: int = PROTOCOL_V3,
+        legacy_hub: bool = False,
     ) -> None:
         """
         Args:
@@ -137,9 +148,10 @@ class HiveMindClient:
                 string. Constrained nodes never derive it on-device (argon2id
                 is infeasible on a microcontroller): compute it once on a
                 capable host (``hivemind-core derive-psk``, equal to
-                ``argon2id(password, SHA-256(node_id))``). Enables the
-                protocol v3 Noise handshake when the server offers it;
-                without it the legacy v0-v2 handshake is used.
+                ``argon2id(password, SHA-256(node_id))``). Required to run
+                the mandatory protocol v3 Noise handshake (HIVEMIND-CRYPTO-1
+                §3, §5); without it, and without ``legacy_hub``, a
+                connection to a hub that cannot negotiate Noise is rejected.
             noise_static_key: This node's static X25519 private key (32 raw
                 bytes or hex). Generated per-connection when omitted;
                 provision + persist it for a stable node identity and to use
@@ -151,7 +163,16 @@ class HiveMindClient:
                 §3.4.5). After an ``XXpsk2`` handshake the learned key is
                 stored here for the caller to persist.
             max_protocol_version: Highest protocol version this client
-                offers (default 3). Set to 2 to force the legacy handshake.
+                offers (default 3). Requires ``legacy_hub=True`` to lower —
+                a v2-capped client can only ever reach a hub through the
+                legacy handshake this option guards.
+            legacy_hub: Operator opt-in to the pre-v3 password handshake for
+                hubs that cannot run Noise. Off by default: the client never
+                chooses the legacy path on its own, regardless of what the
+                hub offers (HIVEMIND-CRYPTO-1 §3, §5). When set, ``connect()``
+                prints a loud warning that the legacy handshake is not a
+                PAKE, has no forward secrecy, and is scheduled for removal in
+                ``LEGACY_HANDSHAKE_REMOVAL_VERSION``.
         """
         self.host: str = host
         self.port: int = port
@@ -186,6 +207,19 @@ class HiveMindClient:
         self.noise_static_key: Optional[bytes] = _to_bytes(noise_static_key)
         self.server_noise_key: Optional[bytes] = _to_bytes(server_noise_key)
         self.max_protocol_version: int = max_protocol_version
+        self.legacy_hub: bool = legacy_hub
+        if self.max_protocol_version < PROTOCOL_V3 and not self.legacy_hub:
+            raise ValueError(
+                "max_protocol_version < %d only reaches a hub through the "
+                "legacy handshake; set legacy_hub=True to acknowledge it "
+                "(HIVEMIND-CRYPTO-1 §3, §5)" % PROTOCOL_V3)
+        self._legacy_warning: str = (
+            "HiveMind legacy_hub is enabled: the pre-v3 password handshake "
+            "is not a PAKE and provides no forward secrecy "
+            "(HIVEMIND-CRYPTO-1 §3, §5). It will be removed in "
+            "version %s. Set legacy_hub=False and provision a Noise PSK as "
+            "soon as the hub supports protocol v3." % LEGACY_HANDSHAKE_REMOVAL_VERSION)
+        self.last_error: Optional[str] = None
         self._server_hello_payload: Optional[dict] = None
         self._noise_handshake: Optional[NoiseHandshake] = None
         self._noise_transport: Optional[NoiseTransport] = None
@@ -266,6 +300,8 @@ class HiveMindClient:
         Generates a session ID, builds the authorization header, connects
         to the hub, and enters the receive loop.
         """
+        if self.legacy_hub:
+            print(self._legacy_warning)
         self._session_id = self._generate_session_id()
         auth_raw = f"{self.username}:{self.access_key}".encode()
         auth = b2a_base64(auth_raw).decode().strip()
@@ -374,7 +410,16 @@ class HiveMindClient:
                 # protocol v3: Noise handshake (HIVEMIND-CRYPTO-1 §3.4)
                 await self._start_noise_handshake(payload)
                 return
-            # legacy v0-v2 password handshake: generate client hsub
+            if not self.legacy_hub:
+                # The Noise handshake is mandatory on every connection: there
+                # is no cleartext, pre-shared-key, or password alternative
+                # and no protocol-version ladder to negotiate down
+                # (HIVEMIND-CRYPTO-1 §3), and a node MUST reject any peer
+                # that cannot complete it, with no legacy fallback (§5).
+                # This is never chosen from what the hub offers.
+                await self._reject_legacy()
+                return
+            # operator-set legacy_hub: pre-v3 password handshake
             iv, hsub_hex = generate_hsub(self.password)
             self._client_iv = iv
             self._client_hsub = hsub_hex
@@ -426,7 +471,9 @@ class HiveMindClient:
         ``max_protocol_version`` >= 3 together with Noise
         ``patterns``/``suites`` this client can run (ChaChaPoly), and a
         32-byte PSK must be provisioned (§3.4.4 — never derived on-device).
-        Any other combination falls back to the legacy v0-v2 handshake.
+        Any other combination is rejected unless the operator set
+        ``legacy_hub`` (HIVEMIND-CRYPTO-1 §3, §5) — the choice never
+        depends on what the hub offers.
         """
         if self.psk is None or self.max_protocol_version < PROTOCOL_V3:
             return False
@@ -539,6 +586,19 @@ class HiveMindClient:
         """Fatal Noise handshake failure — reject the connection (§3.4.3)."""
         self._noise_handshake = None
         self._noise_transport = None
+        await self.disconnect()
+
+    async def _reject_legacy(self) -> None:
+        """Reject a hub that cannot run Noise when ``legacy_hub`` is unset.
+
+        No ``shake`` response is sent — the client never sends the legacy
+        ``hsub`` envelope on its own initiative (HIVEMIND-CRYPTO-1 §3, §5).
+        """
+        self.last_error = (
+            "hub cannot complete the mandatory Noise handshake and "
+            "legacy_hub is not set; refusing to fall back to the pre-v3 "
+            "password handshake (HIVEMIND-CRYPTO-1 §3, §5)")
+        print(self.last_error)
         await self.disconnect()
 
     # -- message dispatch ---------------------------------------------------
