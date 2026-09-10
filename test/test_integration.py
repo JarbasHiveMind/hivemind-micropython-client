@@ -174,6 +174,7 @@ class TestHandshakeRoundTrip(unittest.TestCase):
             host="mock", port=0, username="u", access_key="k",
             password=_PASSWORD, site_id="mock-sat",
             reconnect_ms=0,  # no auto-reconnect in tests
+            legacy_hub=True,  # MockHub only speaks the v0-v2 password handshake
         )
         hub = MockHub()
         ws = MockWebSocket(hub)
@@ -205,6 +206,7 @@ class TestEncryptedMessageRoundTrip(unittest.TestCase):
         client = HiveMindClient(
             host="mock", port=0, username="u", access_key="k",
             password=_PASSWORD, site_id="mock-sat", reconnect_ms=0,
+            legacy_hub=True,  # MockHub only speaks the v0-v2 password handshake
         )
         hub = MockHub()
         ws = MockWebSocket(hub)
@@ -273,6 +275,7 @@ class TestPingPong(unittest.TestCase):
         client = HiveMindClient(
             host="mock", port=0, username="u", access_key="k",
             password=_PASSWORD, site_id="mock-sat", reconnect_ms=0,
+            legacy_hub=True,  # MockHub only speaks the v0-v2 password handshake
         )
         hub = MockHub()
         ws = MockWebSocket(hub)
@@ -339,6 +342,7 @@ class TestPingPong(unittest.TestCase):
         client = HiveMindClient(
             host="mock", port=0, username="u", access_key="k",
             password=_PASSWORD, site_id="mock-sat", reconnect_ms=0,
+            legacy_hub=True,  # MockHub only speaks the v0-v2 password handshake
         )
         client._seen_flood_ids = []
         sent = []

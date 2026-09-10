@@ -270,8 +270,58 @@ class TestNoiseHandshakeKK(unittest.TestCase):
         self.assertEqual(hub.received[0][:1], b"\x00")
 
 
-class TestLegacyFallback(unittest.TestCase):
-    """INT-MP-V3-03: v0-v2 keeps working when v3 cannot be negotiated."""
+class TestNoAutomaticLegacyFallback(unittest.TestCase):
+    """HIVEMIND-CRYPTO-1 §3, §5: no cleartext/password alternative and no
+    protocol-version ladder to negotiate down. A hub that cannot complete
+    Noise is rejected unless the operator set ``legacy_hub``, and the
+    rejection never sends the legacy ``hsub`` envelope."""
+
+    def _assert_rejected(self, client, hub):
+        ws = MockWebSocket(hub)
+        sent = []
+        orig = ws.send
+
+        async def spy(data):
+            sent.append(data)
+            await orig(data)
+
+        ws.send = spy
+        _drive(client, ws, until_state=STATE_DISCONNECTED)
+
+        shakes = [json.loads(s) for s in sent if isinstance(s, str)
+                  and json.loads(s).get("msg_type") == "shake"]
+        self.assertFalse(shakes, "client must never send a shake response")
+        for shake in shakes:
+            self.assertNotIn("envelope", shake["payload"])
+        self.assertEqual(client.state, STATE_DISCONNECTED)
+        self.assertIsNotNone(client.last_error)
+        self.assertIn("CRYPTO-1", client.last_error)
+        self.assertIn("legacy", client.last_error)
+
+    def test_no_psk_is_rejected(self):
+        """Server offers v3 but no PSK is provisioned -> rejected, not legacy."""
+        self._assert_rejected(_make_client(psk=None), MockNoiseHub())
+
+    def test_v2_server_is_rejected(self):
+        """Server maxes out at v2 -> rejected, never chosen from its offer."""
+        hub = MockNoiseHub()
+        hub.handshake_payload["max_protocol_version"] = 2
+        self._assert_rejected(_make_client(), hub)
+
+    def test_client_capped_at_v2_requires_legacy_hub(self):
+        """max_protocol_version=2 without legacy_hub is a construction error."""
+        with self.assertRaises(ValueError):
+            _make_client(max_protocol_version=2)
+
+    def test_no_mutual_suite_is_rejected(self):
+        hub = MockNoiseHub()
+        hub.handshake_payload["noise"]["suites"] = ["25519_AESGCM_SHA256"]
+        self._assert_rejected(_make_client(), hub)
+
+
+class TestLegacyHubOptIn(unittest.TestCase):
+    """``legacy_hub=True`` is the only path to the pre-v3 password handshake,
+    and it never depends on what the hub offers."""
 
     def _assert_legacy_shake(self, client, hub):
         ws = MockWebSocket(hub)
@@ -283,7 +333,6 @@ class TestLegacyFallback(unittest.TestCase):
             if isinstance(data, str):
                 msg = json.loads(data)
                 if msg.get("msg_type") == "shake":
-                    # legacy handshake carries an hsub envelope, never noise
                     self.assertIn("envelope", msg["payload"])
                     self.assertNotIn("noise", msg["payload"])
                     return  # don't run the noise hub logic
@@ -295,24 +344,19 @@ class TestLegacyFallback(unittest.TestCase):
                   and json.loads(s).get("msg_type") == "shake"]
         self.assertTrue(shakes, "client never sent a handshake")
 
-    def test_no_psk_falls_back(self):
-        """Server offers v3 but no PSK is provisioned -> legacy hsub path."""
-        self._assert_legacy_shake(_make_client(psk=None), MockNoiseHub())
+    def test_legacy_hub_true_uses_legacy_path_regardless_of_hub_offer(self):
+        """Even a v3-capable hub with a PSK provisioned uses the legacy path
+        once the operator explicitly set legacy_hub=True."""
+        self._assert_legacy_shake(
+            _make_client(legacy_hub=True, max_protocol_version=2),
+            MockNoiseHub())
 
-    def test_v2_server_falls_back(self):
-        """Server maxes out at v2 -> legacy hsub path."""
-        hub = MockNoiseHub()
-        hub.handshake_payload["max_protocol_version"] = 2
-        self._assert_legacy_shake(_make_client(), hub)
-
-    def test_client_capped_at_v2_falls_back(self):
-        self._assert_legacy_shake(_make_client(max_protocol_version=2),
-                                  MockNoiseHub())
-
-    def test_no_mutual_suite_falls_back(self):
-        hub = MockNoiseHub()
-        hub.handshake_payload["noise"]["suites"] = ["25519_AESGCM_SHA256"]
-        self._assert_legacy_shake(_make_client(), hub)
+    def test_legacy_hub_warning_names_removal_version(self):
+        from hivemind.client import LEGACY_HANDSHAKE_REMOVAL_VERSION
+        client = _make_client(legacy_hub=True)
+        self.assertIn(LEGACY_HANDSHAKE_REMOVAL_VERSION, client._legacy_warning)
+        self.assertIn("PAKE", client._legacy_warning)
+        self.assertIn("forward secrecy", client._legacy_warning)
 
 
 if __name__ == "__main__":

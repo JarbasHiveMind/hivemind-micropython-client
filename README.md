@@ -117,7 +117,19 @@ The session key is `PBKDF2(password)` mixed with the two 8-byte IVs exchanged in
 
 ### Protocol v3 (Noise handshake)
 
-When the hub advertises protocol version 3 and a 32-byte PSK is provisioned, the client runs a **Noise handshake** (`Noise_XXpsk2_25519_ChaChaPoly_SHA256`, or `Noise_KKpsk0` when the server's static key is pinned) instead of the legacy exchange above. It adds mutual authentication, forward secrecy, replay resistance, and downgrade protection. All session traffic then flows as Noise transport frames with implicit counter nonces. Without a PSK, or against a v2 hub, the client uses the legacy v0-v2 handshake unchanged.
+The Noise handshake is mandatory on every connection: the client never falls back to the legacy exchange above on its own, regardless of what the hub advertises (HIVEMIND-CRYPTO-1 §3, §5). With a 32-byte PSK provisioned, it runs `Noise_XXpsk2_25519_ChaChaPoly_SHA256`, or `Noise_KKpsk0` when the server's static key is pinned, adding mutual authentication, forward secrecy, replay resistance, and downgrade protection. All session traffic then flows as Noise transport frames with implicit counter nonces. A hub that cannot complete this handshake — no PSK provisioned, capped below protocol v3, or no mutual pattern/suite — is rejected.
+
+### Legacy hubs (`legacy_hub`)
+
+A hub that has not been upgraded past the pre-v3 password handshake can still be reached, but only when the operator explicitly opts in with `legacy_hub=True`. It is off by default and is never chosen from what the hub offers. Setting it makes `connect()` print a loud warning every time: the legacy handshake is not a PAKE and provides no forward secrecy, and it is scheduled for removal. Migrate the hub to protocol v3 and drop `legacy_hub` as soon as possible.
+
+```python
+client = HiveMindClient(
+    host="192.168.1.10", port=5678,
+    username="satellite", access_key="...", password="...",
+    legacy_hub=True,  # operator-acknowledged: hub cannot run Noise yet
+)
+```
 
 A microcontroller never derives the PSK on-device, because argon2id is infeasible there. Compute it once on a capable host with `argon2id(password, SHA-256(node_id))`, for example through `hivemind-core derive-psk`, and pass the 32 bytes as `psk`:
 
@@ -152,7 +164,8 @@ After an `XXpsk2` handshake, the server's static key is available in `client.ser
 | `psk` | Provisioned 32-byte Noise PSK (bytes or hex), enables protocol v3 | `None` |
 | `noise_static_key` | This node's static X25519 private key (bytes or hex) | generated |
 | `server_noise_key` | Pinned server static X25519 public key (bytes or hex) | `None` |
-| `max_protocol_version` | Highest protocol version to offer (`2` forces legacy) | `3` |
+| `max_protocol_version` | Highest protocol version to offer; below `3` requires `legacy_hub=True` | `3` |
+| `legacy_hub` | Operator opt-in to the pre-v3 password handshake for hubs that cannot run Noise; prints a removal warning at connect time | `False` |
 
 ## Troubleshooting
 
