@@ -43,7 +43,11 @@ from hivemind.crypto import (
     CIPHER_CHACHA20,
     _norm_cipher,
 )
-from hivemind.binary import encode as binary_encode, decode as binary_decode
+from hivemind.binary import (
+    encode as binary_encode,
+    decode as binary_decode,
+    MalformedBinaryFrame,
+)
 from hivemind.noise import (
     PROTOCOL_V3,
     NoiseHandshake,
@@ -592,7 +596,11 @@ class HiveMindClient:
             if isinstance(frame, bytes):
                 # HIVEMIND-WIRE-1 binary frame
                 if self.on_binary is not None:
-                    decoded = binary_decode(frame)
+                    try:
+                        decoded = binary_decode(frame)
+                    except MalformedBinaryFrame as e:
+                        print("dropping malformed binary frame:", e)
+                        return
                     self.on_binary(decoded["bin_type"], decoded["payload"])
                 return
             try:
