@@ -6,8 +6,27 @@ manipulation — no external dependencies.
 
 from __future__ import annotations
 
+try:
+    import ujson as json  # type: ignore[import]
+except ImportError:
+    import json  # type: ignore[no-redef]
+
 # Message type constant (must match client.py)
 MSG_BINARY = 12
+
+# HIVEMIND-WIRE-1 §4.1: the frame-format version this client implements.
+FRAME_FORMAT_VERSION = 1
+
+# HIVEMIND-WIRE-1 §4.2: assigned message-type codes (0-10 and 12); 11 is
+# reserved (removed THIRDPRTY), 13-31 are unassigned. A receiver MUST
+# reject any other code as malformed rather than mapping it to a type.
+ASSIGNED_MSG_TYPES = frozenset(range(11)) | {MSG_BINARY}
+
+
+class MalformedBinaryFrame(ValueError):
+    """A WIRE-1 §4 binary frame that cannot be decoded: truncated, a
+    metadata length past the end of the frame, an unassigned message-type
+    code, or a metadata block that is not valid JSON."""
 
 # Binary payload sub-types
 BIN_UNDEFINED = 0
@@ -101,7 +120,7 @@ def encode(msg_type: int, bin_type: int, metadata: bytes,
     Returns:
         Encoded binary frame.
     """
-    version = 1
+    version = FRAME_FORMAT_VERSION
     compressed = False
 
     # Calculate total content bits
@@ -136,28 +155,58 @@ def encode(msg_type: int, bin_type: int, metadata: bytes,
 
 
 def decode(data: bytes) -> dict:
-    """Decode a HiveMind binary frame.
+    """Decode a HiveMind binary frame (HIVEMIND-WIRE-1 §4).
 
     Returns:
         Dict with keys: ``msg_type``, ``bin_type``, ``versioned``,
         ``protocol_version``, ``compressed``, ``metadata``, ``payload``.
+        ``metadata`` is the decoded JSON object; a zero-length metadata
+        block decodes as ``{}`` (§4.1).
+
+    Raises:
+        MalformedBinaryFrame: the frame-format version is not the one
+            this client implements (§4.1), the message-type code is not
+            one of the codes §4.2 assigns, the metadata length claims
+            more bytes than remain in the frame, the metadata block is
+            not valid UTF-8 JSON, or the frame is truncated.
     """
-    r = BitReader(data)
+    try:
+        r = BitReader(data)
 
-    # Skip leading zeros until pad marker (1 bit)
-    while r.read_bits(1) == 0:
-        pass
+        # Skip leading zeros until pad marker (1 bit)
+        while r.read_bits(1) == 0:
+            pass
 
-    versioned = bool(r.read_bits(1))
-    protocol_version = r.read_bits(8) if versioned else 0
-    msg_type = r.read_bits(5)
-    compressed = bool(r.read_bits(1))
-    meta_length = r.read_bits(8)
-    metadata = r.read_bytes(meta_length)
+        versioned = bool(r.read_bits(1))
+        protocol_version = r.read_bits(8) if versioned else 0
+        if versioned and protocol_version != FRAME_FORMAT_VERSION:
+            raise MalformedBinaryFrame(
+                "malformed binary frame: unimplemented frame-format "
+                "version %d" % protocol_version)
+        msg_type = r.read_bits(5)
+        if msg_type not in ASSIGNED_MSG_TYPES:
+            raise MalformedBinaryFrame(
+                "malformed binary frame: unassigned WIRE-1 message-type "
+                "code %d" % msg_type)
+        compressed = bool(r.read_bits(1))
+        meta_length = r.read_bits(8)
+        if meta_length > r.remaining_bytes():
+            raise MalformedBinaryFrame(
+                "malformed binary frame: metadata_len claims %d bytes "
+                "but only %d remain" % (meta_length, r.remaining_bytes()))
+        raw_metadata = r.read_bytes(meta_length)
+        if meta_length:
+            metadata = json.loads(raw_metadata.decode("utf-8"))
+        else:
+            metadata = {}
 
-    bin_type = r.read_bits(4) if msg_type == MSG_BINARY else 0
+        bin_type = r.read_bits(4) if msg_type == MSG_BINARY else 0
 
-    payload = r.read_bytes(r.remaining_bytes())
+        payload = r.read_bytes(r.remaining_bytes())
+    except MalformedBinaryFrame:
+        raise
+    except (IndexError, ValueError, UnicodeDecodeError) as e:
+        raise MalformedBinaryFrame("malformed binary frame: %s" % e) from e
 
     return {
         "msg_type": msg_type,
