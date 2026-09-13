@@ -404,7 +404,11 @@ class HiveMindClient:
             self._set_state(STATE_HELLO_RECEIVED)
 
         elif self.state == STATE_HELLO_RECEIVED and msg_type == "shake":
-            if not payload.get("handshake"):
+            # hivemind-core 5.x sends its step-2 parameters without the legacy
+            # "handshake" flag: the Noise parameters are what identify the
+            # message (HIVEMIND-CRYPTO-1 §3.3). Require one or the other.
+            if not payload.get("handshake") and not isinstance(
+                    payload.get("noise"), dict):
                 return
             if self._should_use_noise(payload):
                 # protocol v3: Noise handshake (HIVEMIND-CRYPTO-1 §3.4)

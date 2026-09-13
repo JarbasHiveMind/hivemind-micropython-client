@@ -16,7 +16,9 @@ ESP32 / Pico (this client)  ⇄  HiveMind hub (hivemind-core)  ⇄  OVOS skills
 ## Features
 
 - **Tiny**: pure Python plus the MicroPython stdlib. No pip packages are required on-device.
-- **Encrypted**: AES-256-GCM or ChaCha20-Poly1305 AEAD. The key comes from your password through PBKDF2-HMAC-SHA256.
+- **Encrypted**: the protocol v3 Noise handshake with ChaCha20-Poly1305, keyed by a 32-byte PSK
+  provisioned from your password (see [Protocol v3](#protocol-v3-noise-handshake)). The
+  PBKDF2-HMAC-SHA256 password handshake is only for a legacy hub, with `legacy_hub=True`.
 - **Dual platform**: runs on MicroPython hardware and on CPython for development and testing, auto-detected at import.
 - **Binary transport**: bitstring-encoded frames for streaming audio to and from the hub.
 - **Async**: non-blocking I/O on `uasyncio` (MicroPython) or `asyncio` (CPython).
